@@ -36,7 +36,7 @@ const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 /** Package name; also the directory name inside the runtime `node_modules`. */
 const PACKAGE_NAME = "dsh-session-log-universal";
 /** Files always copied, relative to the package root. */
-const ROOT_FILES = ["package.json"];
+const ROOT_FILES = ["package.json", "cordis.patch.yml"];
 /** Directories whose top-level `.js` files are copied, relative to the package root. */
 const SCRIPT_DIRECTORIES = ["lib"];
 
