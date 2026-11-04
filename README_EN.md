@@ -101,22 +101,35 @@ When the write is refused or fails in transport, the UI keeps showing the accept
 
 The page is the plugin's own tab inside the built-in plugins settings section (registered into the root list slot `settings.plugins.tab`, id `upload-status`, order 20, after the read-only plugin inventory). No official package is touched.
 
-The top of the page holds the totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial appears only while such a session exists, so usually four cards, five when it matters) — plus the instant the data was generated, the current collector endpoint and a **Refresh** button. Below them: a search box (title, session id or directory) and one row per session:
+The top of the page holds the totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial appears only while such a session exists, so usually four cards, five when it matters) — plus the instant the data was generated, the current collector endpoint and a **Refresh** button. Below them: a search box (title, session id or directory) and one row per session.
 
-- the row title is the session's own `session/title`, falling back to the first human prompt;
-- the second line is the cwd, and a subagent session is labelled as such;
-- the facts line shows the event count (`{count} events`) and the upstream progress (`{acked}/{total} events uploaded`, where `acked` is a count — the acknowledged seq plus one);
-- the badge on the right is **green = uploaded** (a 2xx covered the whole log) or **light gray = not uploaded / partial** (never acknowledged, or acknowledged only up to an earlier prefix);
-- under the badge sits the upstream evidence: the HTTP status of that acknowledgement, how long ago it happened, and any `partialSuccess` note from the collector (how many records it rejected and why) — so "offline", "401" and "the collector accepted only part of it" do not all look the same;
-- conversations that never produced a single event are hidden by default (hundreds of empty rows would bury the ones that can say something) behind one line saying how many were hidden; they still count in the totals.
+"Uploaded events" is `totals.ackedEvents`: the sum of the **acknowledged event counts** (a session with an unknown length contributes `ackedSeq + 1`). `totals.events` is only a **lower bound on the known counts** — historical sessions have no count, so it is often 0 — and the page does not use it as its headline number.
+
+Each row shows:
+
+- the session's own `session/title`, falling back to the first human prompt;
+- the cwd, and a subagent session is labelled as such;
+- facts: event count, log size and upstream progress. A **known** count renders `{count} events`; an unknown count with no acknowledgement renders `event count unknown` — **never a 0**. Log size renders as `1.2 MB log`. Progress renders as `{acked}/{total} events uploaded`, `{acked} events uploaded · total unknown`, or `acknowledged through {acked} · newer content exists`;
+- the badge on the right is **green = uploaded** (a 2xx covered the whole log) or **light gray = not uploaded / partial**;
+- under the badge sits the upstream evidence: the HTTP status of that acknowledgement, how long ago it happened, and any `partialSuccess` note from the collector (how many records it rejected and why) — so "offline", "401" and "the collector accepted only part of it" do not all look the same.
+
+Above the list one line reports visibility: `{visible} of {sessions} conversations shown`; with empty conversations hidden it becomes `…; {hidden} empty conversations hidden (no events)`. At the bottom, a truncated report adds `{count} conversations with content are not shown (at most 500 are listed)`.
+
+**Empty conversations** (not a single event) do not take a row by default: hundreds of empty rows would bury the ones that can say something. The Host decides with `isEmpty` — `localEvents === 0`, or, when the count is unknown, a physical log size `sizeBytes <= 4096` (`EMPTY_LOG_BYTES`; measured header-only logs run up to 2231 bytes and the smallest log holding an event is 8192 bytes, so 4096 sits in the middle of the safe gap). Empty conversations still count in the totals.
+
+**Order**: sessions with content first (`isEmpty` false before true), newest write first inside each group — so the 500-row cap is spent on conversations that actually hold events.
 
 The badge is derived from **locally recorded upstream evidence**, never from "we handed the record to the transport":
 
 | Badge | Rule | Meaning |
 |---|---|---|
-| Uploaded (green) | `ackedSeq + 1 >= localEvents` | the confirmed range covers the whole local log |
-| Partial (light gray) | an ack exists but covers a prefix | the head is in, the tail is still owed (typically a turn just ended) |
-| Not uploaded (light gray) | no ack at all | nothing was confirmed yet, or the session has not had its turn |
+| Not uploaded (light gray) | `ackedSeq == null` | no upstream confirmation at all |
+| Uploaded (green) | count known: `ackedSeq + 1 >= localEvents` | the confirmed range covers the whole local log |
+| Uploaded (green) | count unknown: `updatedAt <= ackedAt + 60000` | the log has not been written since the acknowledgement (the 60 s grace absorbs flush delay and the round trip), so no owed tail can be proven |
+| Partial (light gray) | count known: `ackedSeq + 1 < localEvents` | the acknowledgement covers a prefix only |
+| Partial (light gray) | count unknown: `updatedAt > ackedAt + 60000` | the log was written again after the acknowledgement |
+
+> **Why a count can be unknown:** the shipped JSONL persistence backend returns only header / `sizeBytes` / `revision` from `list()`; it does not return `eventCount` (that contract is "when the backend can provide it cheaply"). Historical sessions therefore report `localEvents` / `localSeq` as `null`, and only a **live** session — whose log is in memory — has a real count. The page treats `null` as unknown: never as 0, and never as an invented number.
 
 ### Where the data comes from
 
@@ -130,8 +143,8 @@ GET /plugin/session-log-universal/report
 |---|---|
 | Methods | GET only; anything else answers `405` with `allow: GET` |
 | Access | loopback only (`127.0.0.1`, `localhost`, `::1` and their port forms); a foreign `host` answers `403` — the payload carries session titles and directories and does not belong off this machine |
-| Caching | `cache-control: no-store`; the Host rebuilds roughly every 5 seconds (nothing is built while nobody watches; the idle cadence is 60 seconds) |
-| Rows | at most 500; beyond that `truncated: true`, while the totals still count **every** session and the page says it lists only recent conversations |
+| Caching | `cache-control: no-store`; the same report is reused for 5 seconds. Rebuilding on the 5 s cadence happens **only while the route was read within the last 30 seconds**; with no client watching, nothing is built at all (the timer idles without doing work) |
+| Rows | at most 500, **sessions with content first**; beyond that `truncated: true` plus `moreSessions` (how many sessions that do hold content were left out of the 500). Totals still count **every** session |
 | Failures | a refused build answers `500` with the diagnostic, never an empty table |
 
 Two ways to audit it:
@@ -327,7 +340,8 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - The queue bound (4096 records by default) can be reached after a long offline stretch and a sudden recovery; the status page then shows gray dots and the watermark trails until the collector is reachable again or `/uploadlog` runs. Records are not silently dropped.
 - A single event larger than `maxRequestBytes` (4 MB by default) cannot be split; it is skipped with a warning.
 - Non-2xx 4xx answers (except 429) are treated as a permanent refusal of that batch: the records stay unacknowledged for a later replay, so a wrong `url` retries and warns forever.
-- The status page lists at most the 500 most recent sessions (totals still count every session) and says so when it truncates.
+- Historical sessions have no known event count (the JSONL backend's `list()` returns no `eventCount`); only live sessions have a real count. For an unknown count the page falls back to comparing the acknowledgement time with the log's last write, with a 60 second grace window (see the badge table above).
+- The status page lists at most 500 sessions and prefers sessions that hold content (totals still count every session); the number left out is published as `moreSessions` and shown at the bottom of the list.
 - The status page needs the Host web server: a composition without `webServer` (headless, ACP) keeps uploading, but the route is absent and the page reports a read failure.
 - Meaningful for the web profile only (`dsh.client.platform: web`); headless and ACP profiles have no settings UI and keep only the Host-side upload.
 

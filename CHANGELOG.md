@@ -36,6 +36,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The status page no longer assumes an event count is available: the shipped
+  JSONL backend lists sessions without `eventCount`, so a stored session reports
+  `localEvents: null` and the state falls back to comparing the acknowledgement
+  time with the log's last write (60 s grace). Rows carry `sizeBytes` and
+  `isEmpty`, and `localEvents` is `null` rather than a fabricated zero.
+- Report ordering spends the 500-row cap on sessions that hold events (content
+  first, newest write first inside each group) and publishes `moreSessions` for
+  what the cap left out. `totals.events` is documented as a lower bound;
+  `totals.ackedEvents` is the headline number.
+- Rebuilding is activity-gated: the report is reused for 5 s and rebuilt on that
+  cadence only while the route was read within the last 30 s, so an unopened
+  plugin does no report work at all.
+- Titles: 96 events scanned per log, 32 new titles per rebuild (96 on the first
+  build), so a freshly opened page fills 500 rows in about a minute.
 - `package.json` is publishable (`private: false`, `files`, `exports`,
   `dsh.client` declaration, license and repository fields).
 

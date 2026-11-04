@@ -139,10 +139,23 @@ A manual re-send drops the queued copies of that session first, so the re-read c
 
 `lib/report.js` owns everything the status page needs, and it is built off the capture path:
 
-- A `SessionReport` rebuilds on a timer (5 s while a client is asking, 60 s when idle) and answers from the cached value, so `session/event` never pays for it. With no client around, nothing is built.
-- Sources: `sessionPersistence.list()` for stored session headers and event counts, `ctx.sessions.list()` for live sessions (which answer from memory and therefore never trail their own log), the watermark rows for the acknowledgement, a directory sweep of `<DSH_HOME>/sessions/*/*.jsonl` for activity timestamps, and a bounded log read (96 events, 8 sessions per rebuild) for titles.
-- At most 500 rows are published, newest activity first; totals count every session, so a truncated table still answers "how much of the corpus is uploaded".
-- `state` is derived, not stored: `uploaded` when `ackedSeq + 1 >= localEvents`, `partial` when an acknowledgement exists but covers only a prefix, `never` when there is none.
+- A `SessionReport` answers from a cached value and rebuilds at most every `REPORT_REFRESH_MILLIS` (5 s), and only while somebody is reading: a tick does nothing unless the route was requested within `REPORT_ACTIVE_MILLIS` (30 s). A plugin nobody opened performs no report work at all — the timer wakes, sees no reader and returns.
+- Sources: `sessionPersistence.list()` for stored session headers, sizes and revisions (cached for `INVENTORY_CACHE_MILLIS`, 10 s), `ctx.sessions.list()` for live sessions (which answer from memory and therefore never trail their own log), the watermark rows for the acknowledgement, a directory sweep of `<DSH_HOME>/sessions/*/session*.jsonl` for activity timestamps and physical sizes (cached for `STORAGE_SCAN_MILLIS`, 30 s), and a bounded log read for titles.
+- Titles: each read scans the first `TITLE_SCAN_EVENTS` (96) events of a log; a normal rebuild resolves `TITLE_BATCH` (32) new titles, the very first rebuild `TITLE_FIRST_BATCH` (96). The cache is per process and retries an empty title after `TITLE_RETRY_MILLIS` (60 s), so a page that has just opened fills its 500 rows over roughly a minute instead of showing short ids for minutes.
+- **Event counts are only known for live sessions.** The shipped JSONL backend's `list()` returns header / `sizeBytes` / `revision` and no `eventCount` (that field is "provided when the backend can do it cheaply"), so a stored session reports `localEvents: null` and `localSeq: null`. `totals.events` is therefore a **lower bound** over the known counts, while `totals.ackedEvents` counts the acknowledged prefix of every session (unknown-length ones contribute `ackedSeq + 1`).
+- **Publish order**: sessions that hold events before empty ones, newest write first inside each group (`orderSessions`). At most `REPORT_MAX_ROWS` (500) rows are published, so the cap is spent on conversations; `truncated` says the table was cut, `moreSessions` says how many sessions **with content** fell outside it.
+- **Emptiness** is decided once, in `isEmptyOf`: `localEvents === 0`, or — when the count is unknown — `sizeBytes <= EMPTY_LOG_BYTES` (4096). That bound is measured, not derived: across 856 logs on the development machine, header-only logs run up to 2231 bytes (older generations) while the smallest log holding an event is 8192 bytes.
+- `state` is derived, not stored:
+
+| condition | state |
+|---|---|
+| `ackedSeq == null` | `never` |
+| count known, `ackedSeq + 1 >= localEvents` | `uploaded` |
+| count known, `ackedSeq + 1 < localEvents` | `partial` |
+| count unknown, `updatedAt > ackedAt + PARTIAL_GRACE_MILLIS` (60 000 ms) | `partial` |
+| count unknown, otherwise | `uploaded` |
+
+  The grace window covers the uploader's flush delay plus the round trip, so an ordinary turn is not mistaken for an owed tail while a genuinely newer write still is. Totals count every session, so a truncated table still answers "how much of the corpus is uploaded".
 
 The route:
 
@@ -151,7 +164,7 @@ The route:
 | path | `GET /plugin/session-log-universal/report` (exact match, registered through `ctx.inject(["webServer"], ...)` on a child context) |
 | methods | GET only (405 otherwise) |
 | access | loopback `host` header only (403 otherwise) — the response carries session titles and working directories |
-| caching | `cache-control: no-store`, `content-length`; a refused build answers 500 with the diagnostic instead of an empty table |
+| caching | `cache-control: no-store`, `content-length`; the value is reused for `REPORT_REFRESH_MILLIS` (5 s) and rebuilt only while the route was read within `REPORT_ACTIVE_MILLIS` (30 s). A refused build answers 500 with the diagnostic instead of an empty table |
 | absent web server | uploading keeps working, the route simply does not exist; a conflicting registration is a warning, not a failure |
 
 Report value:
@@ -162,17 +175,33 @@ Report value:
   "generatedAt": 1762200000000,
   "endpoint": "https://dsh-otel-collector.deepseeksvc.com/v1/logs",
   "enabled": true,
-  "truncated": false,
-  "totals": { "sessions": 37, "uploaded": 30, "partial": 2, "never": 5, "events": 8123, "ackedEvents": 7900 },
-  "rows": [{
-    "sessionId": "...", "title": "...", "cwd": "D:\\work", "parentSession": null,
-    "updatedAt": 1762200000000, "localSeq": 41, "localEvents": 42,
-    "ackedSeq": 41, "ackedAt": 1762199990000,
-    "upstream": { "code": 200, "at": 1762199990000, "note": null },
-    "state": "uploaded"
-  }]
+  "truncated": true,
+  "moreSessions": 137,
+  "totals": { "sessions": 856, "uploaded": 690, "partial": 3, "never": 163, "events": 412, "ackedEvents": 5310 },
+  "rows": [
+    {
+      "sessionId": "5f0c...1a", "title": "Fix the flaky reconciliation test",
+      "cwd": "D:\\work\\billing", "parentSession": null,
+      "updatedAt": 1762200000000,
+      "localSeq": null, "localEvents": null, "sizeBytes": 184320, "isEmpty": false,
+      "ackedSeq": 211, "ackedAt": 1762199950000,
+      "upstream": { "code": 200, "at": 1762199950000, "note": null },
+      "state": "uploaded"
+    },
+    {
+      "sessionId": "77b2...9c", "title": null,
+      "cwd": "D:\\work\\billing", "parentSession": "5f0c...1a",
+      "updatedAt": 1762199000000,
+      "localSeq": 40, "localEvents": 41, "sizeBytes": 23347, "isEmpty": false,
+      "ackedSeq": 12, "ackedAt": 1762198800000,
+      "upstream": { "code": 207, "at": 1762198800000, "note": "partialSuccess: 1 record(s) rejected" },
+      "state": "partial"
+    }
+  ]
 }
 ```
+
+The first row is a stored session: its length is unknown, so the state came from the timestamps. The second row is live in memory, so it carries a real count — and its receipt shows a `207` with the collector's `partialSuccess` note. `totals.events` (412) counts only the sessions whose length is known, which is why the page headlines `ackedEvents` instead.
 
 ### 8. Configuration surface
 
@@ -219,17 +248,17 @@ The status tab does not poll the Host config: a `ReportFeed` fetches the report 
 
 The request goes out as `plugin/session-log-universal/report` — the **document-relative** form, without the leading slash — through `globalThis.__DSH_TRANSPORT__.fetch` when the shell injected one, falling back to `fetch`. The desktop window is served from a custom scheme, so a rooted path is not the same origin as the Host route; the relative form is the one the shipped transport accepts. A plain browser tab reaches the identical route as `http://127.0.0.1:<port>/plugin/session-log-universal/report`.
 
-The tab renders, in order: the five totals (sessions, uploaded, partial, never, uploaded events), the generation instant, the collector endpoint, a Refresh button, a search box filtering by title / session id / directory, and one row per session:
+The tab renders, in order: the totals (sessions, uploaded, partial, never, **uploaded events** = `totals.ackedEvents`), the generation instant, the collector endpoint, a Refresh button, one line of visibility counters, the search box (title / session id / directory), the row list, and — when the report was cut — a line saying how many conversations with content are not shown (`moreSessions`).
 
 | row part | source |
 |---|---|
 | title | `title`, falling back to the session id, then "untitled conversation" |
 | directory | `cwd`, or "unknown directory" |
-| facts | `localEvents`, `ackedSeq`/`localSeq`, and a subagent marker when `parentSession` is set |
-| badge | `state` → green 已上传 / light gray 未上传 or 部分 {acked}/{total} |
+| facts | event count (`localEvents` — "event count unknown" when `null`, never a 0), log size (`sizeBytes`), upstream progress (`acked`/`total`, or `acked` only when the total is unknown, or "acknowledged through N · newer content exists" for an open-ended partial), and a subagent marker when `parentSession` is set |
+| badge | `state` → green 已上传 / light gray 未上传, or 部分 {acked}/{total} 条 when the count is known and plain 部分上传 when it is not |
 | evidence | `upstream.code` as `HTTP nnn`, `ackedAt` as a relative time, `upstream.note` as the tooltip |
 
-Conversations that hold no event at all are filtered out of the list (a line above it says how many were hidden); they keep counting towards the totals, so the list stays a list of conversations that can actually say something about uploads.
+Visibility is decided by the Host's `isEmpty`, not by the client: a conversation with no events takes no row (a line above the list counts the hidden ones, and the row still counts in the totals), and `totals.events` is deliberately not shown as a headline because it is only a lower bound. The list is therefore conversations that can actually say something about uploads.
 
 Colour is a CSS `data-state` attribute on the badge (`uploaded` uses the theme success token, `partial` and `never` share the muted surface), so the state that the Host derived is the only thing the client has to agree on.
 
@@ -254,7 +283,7 @@ Two dictionaries live in the bundle (`settings.sessionLogUniversal` for the swit
 
 | file | covers | runs |
 |---|---|---|
-| `tests/report.test.mjs` | `stateOf`, `upstreamOf`, `titleFromEvents`, `buildReport`, `reportHandler`, `describeResponse`, the published constants, and `emptyReport` | everywhere |
+| `tests/report.test.mjs` | `stateOf` (both length-known and length-unknown branches), `isEmptyOf`, `upstreamOf`, `titleFromEvents`, `buildReport` (order, totals, `moreSessions`, truncation), `SessionReport` title budgets and source-failure degradation, `reportHandler`, `describeResponse`, the published constants and `emptyReport` | everywhere |
 | `tests/watermark.test.mjs` | monotonic advance, receipts, failure evidence, atomic write and reload, legacy `{seq, at}` rows, corrupt-file recovery | needs `@deepseek-ai/schemastery`, so it skips itself in a plain checkout; set `DSH_SLU_HOST_MODULE` to an installed `lib/index.js` to run it |
 
 The route handler is exercised against a fake `request`/`response` pair, which is what pins the contract the client depends on: `200` with `content-type` and `cache-control: no-store`, `405` plus `allow: GET`, `403` for a foreign authority, and `500` with the diagnostic when the build throws.
