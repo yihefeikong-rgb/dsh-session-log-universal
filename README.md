@@ -101,13 +101,14 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
 
 这一页是本插件注册进内置插件设置页（`settings.plugins.tab` 这个根级 list slot）的独立标签页（id `upload-status`，order 20，排在只读的“插件列表”之后），不需要改任何官方包。
 
-页面顶部是 5 个统计卡——**会话总数 / 已上传 / 部分上传 / 未上传 / 已上传事件**——加数据生成时间、当前采集端地址和一个「刷新」按钮；下面是搜索框（按标题、会话 ID 或目录过滤）与逐会话的列表：
+页面顶部是统计卡——**会话总数 / 已上传 / 部分上传 / 未上传 / 已上传事件**（「部分上传」只在确实存在这种会话时才出现，所以通常是 4 张、需要时 5 张）——加数据生成时间、当前采集端地址和一个「刷新」按钮；下面是搜索框（按标题、会话 ID 或目录过滤）与逐会话的列表：
 
 - 每行标题取会话自己的 `session/title`，没有标题时退回第一条人类提问；
 - 第二行是 cwd，子代理会话会标注出来；
-- 事实行显示事件数（`事件 N`）与上游确认进度（`已上传 seq acked/total`）；
+- 事实行显示事件数（`事件 N`）与上游确认进度（`已上传 acked/total 条`，`acked` 是确认到的条数，即已确认 seq + 1）；
 - 右侧是状态徽标：**绿色 = 已上传**（收集端 2xx 已覆盖整段日志）、**浅灰 = 未上传或部分上传**（一次都没被确认，或只确认到更早的前缀）；
 - 徽标下面是上游证据：这次确认的 HTTP 状态码、距现在多久，以及收集端返回里的 `partialSuccess` 说明（被拒了几条记录、为什么），所以“没网”“401”“收集端说收了一部分”在页面上是能区分开的。
+- 一个事件都没有的空会话默认不占列表（几百条空会话会把真正有信息的行埋掉），页面用一行提示“已隐藏 N 个空会话（无任何事件）”；这些会话仍然计入合计。
 
 判定标准是**本地记录的“上游已收录”证据**，不是“我们把它交给传输层了”：
 
@@ -117,9 +118,30 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
 | 部分上传（浅灰） | 有 ack，但只覆盖前缀 | 前面传上去了，尾巴还欠着（通常是刚结束一轮、还没到 flush 点） |
 | 未上传（浅灰） | 没有任何 ack 记录 | 一条都还没被确认，或这个会话还没轮到 |
 
-数据不走设置文档，而是来自 Host 的一个只读路由 `GET /plugin/session-log-universal/report`：只接受 GET、只服务回环地址、`cache-control: no-store`、约 5 秒缓存、最多 500 行（多出来的只计入合计并在页面上提示“仅列出最近的会话”）。开关关掉时页面顶部会显示一条“上传开关已关闭，新事件不会再上传”的提示。
+### 数据从哪来
 
-> 说明：这条路由此前“通过 `configForms` 把 Host 字段镜像给客户端”的做法演进而来——volatile 配置字段只有在插件的**原始**配置变化时才会被 `describe` 重新读取，而水位线是 Host 自己写的，永远不会触发那次读取。一张几百行的表也不该塞进设置文档里让其它界面一起付成本。
+这一页的数据来自 Host 注册的一个**只读路由**：
+
+```text
+GET /plugin/session-log-universal/report
+```
+
+| 项 | 行为 |
+|---|---|
+| 方法 | 只接受 GET；其它方法返回 `405`（带 `allow: GET`） |
+| 访问范围 | 只服务回环地址（`127.0.0.1` / `localhost` / `::1` 及其端口写法）；其它 `host` 返回 `403` —— 响应里带会话标题和目录，不该出本机 |
+| 缓存 | 响应头 `cache-control: no-store`；Host 侧约 5 秒重建一次（没人看时不重建，空闲 cadence 60 秒） |
+| 行数 | 最多 500 行；超出时 `truncated: true`，合计仍按**全部**会话统计，页面提示“仅列出最近的会话” |
+| 失败 | 报告构建失败返回 `500` 和诊断信息，而不是一张空表 |
+
+审计时有两种读法：
+
+- 浏览器直接打开 `http://127.0.0.1:<webserver 端口>/plugin/session-log-universal/report`，就是原始的 JSON；
+- 桌面应用里页面本身是自定义 scheme，所以客户端不用 `fetch` 的相对路径，而是经 shell 提供的 `__DSH_TRANSPORT__.fetch` 取同一路径的**文档相对形式**（`plugin/session-log-universal/report`，没有前导斜杠）——同一个路由，两种到达方式。
+
+开关关掉时页面顶部会显示一条“上传开关已关闭，新事件不会再上传”的提示。
+
+> **为什么不用 `configForms`：** 我们最初确实想走“volatile 配置字段镜像到客户端”这条路，但它不成立——`describe` 只在插件**原始 config 发生变化**时重新读取 volatile 字段，而水位线是 Host 自己写的，原始 config 永远不会因此变化，值就永远推不出去。所以最终拆成两半：开关仍然走 `configForms`（它由用户操作触发，天然会触发那次重读），报告走这条只读路由。同时这也避免了把一张几百行的表塞进设置文档里，让其它界面一起付渲染和序列化成本。维护时请保持这个分工。
 
 ## 水位线与可靠投递
 
@@ -134,19 +156,21 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
       "at": 1762200000000,
       "code": 200,
       "note": null,
-      "failCode": 503,
-      "failAt": 1762199000000,
-      "failNote": "collector returned HTTP 503"
+      "failCode": null,
+      "failAt": null,
+      "failNote": null
     }
   }
 }
 ```
 
-- `seq` 是该会话**已被收集端 2xx 确认**的最高事件序号，逐会话、只增不减。
-- `at` 是确认时间（epoch 毫秒）；`code`/`note` 是这次确认收到的 HTTP 状态与收集端返回里的说明（`partialSuccess`、错误信息），也就是状态页上那条“上游证据”。
-- `failCode`/`failAt`/`failNote` 是最近一次被拒的尝试（含网络层失败，此时 `failCode` 为 `null`）。**被拒不会推进 `seq`**，只是把失败证据记下来，所以一行可以同时显示“上游确认到了哪”和“最近为什么发不出去”。
+- `seq`：该会话**已被收集端 2xx 确认**的最高事件序号，逐会话、只增不减。
+- `at`：确认时间（epoch 毫秒）。
+- `code`：这次确认收到的 HTTP 状态码（例如 `200`、`202`）。老文件没有这个字段时按 `200` 读——只有 2xx 才会推进 `seq`，所以“缺状态”本身就等于“它被一次 2xx 推进过”。
+- `note`：上游响应里的说明，主要是 `partialSuccess`（收了一部分、拒了几条）一类的提示，没有就是 `null`。`code` + `note` 合起来就是状态页上那条“上游证据”。
+- `failCode`/`failAt`/`failNote`：**最近一次被拒/失败的尝试**（含网络层失败，此时 `failCode` 为 `null`）。被拒**不推进 `seq`**，只把失败证据记下来，所以一行可以同时显示“上游确认到了哪”和“最近为什么发不出去”。
+- **向后兼容**：老文件里缺少的字段一律按 `null` 读（`code` 按 `200`），只写了 `{seq, at}` 的历史行不需要迁移、也不会被误判成失败；下一次确认会补齐收据字段。
 - 写入走临时文件 + 原子 rename，并且合并到最多每秒一次；写盘失败时以内存为准，下次变更再试。
-- 早期版本（只有 `seq`/`at`）写下的行照旧有效：缺少的状态按“它就是这么被 2xx 推进的”来读。
 
 可靠性语义可以一句话概括：**水位线只会落后于现实，永远不会超前。** 具体是：
 
@@ -242,13 +266,46 @@ dsh-session-log-universal/
 │  └─ client.js         # Client 半边：模块加载器包装的浏览器 bundle（零构建）
 ├─ scripts/
 │  └─ sync-dev.mjs      # 把仓库同步到运行副本（幂等，--dry-run / --check / --target）
+├─ tests/
+│  ├─ index.js          # `node --test tests/` 的入口，导入下面两个套件
+│  ├─ report.test.mjs   # 报告/路由：自包含，随时可跑
+│  └─ watermark.test.mjs# 水位线：需要 harness 运行环境，否则自动 skip
 ├─ docs/
 │  └─ architecture.md   # Host / Client 两侧的流程与契约
-├─ package.json         # 包元数据、dsh.client 声明、同步脚本
+├─ package.json         # 包元数据、dsh.client 声明、sync / test / check 脚本
 ├─ CHANGELOG.md
 ├─ LICENSE              # MIT
 ├─ README.md
 └─ README_EN.md
+```
+
+## 开发
+
+零构建：`lib/index.js` 与 `lib/report.js` 是普通 ESM 模块，`lib/client.js` 是 `window.__ModuleLoader__.load({ id, factory })` 包装的浏览器 bundle——全部手写，没有打包器，也没有构建脚本。
+
+两半的生效成本不一样，务必分清：
+
+| 半边 | 改完怎么生效 |
+|---|---|
+| Client（`lib/client.js`） | client-hmr 轮询运行副本的 bundle，**保存即热更新**；页面会重新挂载，React 状态（搜索词、滚动位置、刷新时间）随之重置，这是预期行为 |
+| Host（`lib/index.js`、`lib/report.js`） | **没有热更新**：进程里已导入的旧模块不会重新加载，改完必须重启一次桌面应用。重启前会看到这样的错位现象——客户端已经拿着新 bundle 去请求 `/plugin/session-log-universal/report`，而旧 Host 没注册这条路由，于是状态页显示读取失败 |
+
+日常循环：
+
+```bash
+npm run sync      # 仓库 → 运行副本（lib/*.js + package.json），幂等
+npm test          # node --test "tests/*.test.mjs"
+npm run check     # 三个 lib 文件的语法检查
+```
+
+测试有三种等价跑法，结果一样：`npm test`、`node --test tests/`（目录入口是 `tests/index.js`）、`node tests/report.test.mjs`（单文件）。
+
+- `node scripts/sync-dev.mjs --dry-run` 只打印计划；`--check` 有漂移就退出码 1（适合放进预提交钩子）；`--target <dir>` 或环境变量 `DSH_RUNTIME_DIR` 可指向别的副本。
+- `tests/report.test.mjs` 完全自包含（内存 stub、无 fixture 文件、不联网、不读 harness home）：状态判定、上游证据、标题抽取、报告聚合与截断、路由的 200/405/403/500 与响应头。
+- `tests/watermark.test.mjs` 覆盖水位线（单调推进、收据、失败证据、原子落盘与重载、老文件兼容、损坏文件自愈）。它需要 `@deepseek-ai/schemastery`，而这个 peer 只存在于 harness 运行环境里，所以在纯 checkout 里会自动 skip；指向已安装的副本就能真跑：
+
+```bash
+DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\lib\index.js" node tests/watermark.test.mjs
 ```
 
 ## 协议端点

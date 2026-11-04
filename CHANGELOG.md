@@ -26,6 +26,12 @@ All notable changes to this project are documented here. The format follows
   budgeted.
 - `scripts/sync-dev.mjs`, so a checkout can be copied into the runtime copy the
   loader imports (`--dry-run`, `--check`, `--target`, idempotent).
+- Test suite under `tests/` (`npm test`): the report and its route are covered by
+  self-contained in-memory assertions, and the watermark by tests that skip
+  themselves outside a harness installation.
+- Documentation for maintainers: how the two halves become live (client hot
+  reload vs. one restart for the Host), the test commands, and why the report
+  travels over a route instead of a volatile Config field.
 - English README, architecture notes and packaging metadata for publishing.
 
 ### Changed

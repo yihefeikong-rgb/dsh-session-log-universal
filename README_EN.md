@@ -101,13 +101,14 @@ When the write is refused or fails in transport, the UI keeps showing the accept
 
 The page is the plugin's own tab inside the built-in plugins settings section (registered into the root list slot `settings.plugins.tab`, id `upload-status`, order 20, after the read-only plugin inventory). No official package is touched.
 
-The top of the page holds five totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** — plus the instant the data was generated, the current collector endpoint and a **Refresh** button. Below them: a search box (title, session id or directory) and one row per session:
+The top of the page holds the totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial appears only while such a session exists, so usually four cards, five when it matters) — plus the instant the data was generated, the current collector endpoint and a **Refresh** button. Below them: a search box (title, session id or directory) and one row per session:
 
 - the row title is the session's own `session/title`, falling back to the first human prompt;
 - the second line is the cwd, and a subagent session is labelled as such;
-- the facts line shows the event count (`{count} events`) and the upstream progress (`acked seq acked/total`);
+- the facts line shows the event count (`{count} events`) and the upstream progress (`{acked}/{total} events uploaded`, where `acked` is a count — the acknowledged seq plus one);
 - the badge on the right is **green = uploaded** (a 2xx covered the whole log) or **light gray = not uploaded / partial** (never acknowledged, or acknowledged only up to an earlier prefix);
-- under the badge sits the upstream evidence: the HTTP status of that acknowledgement, how long ago it happened, and any `partialSuccess` note from the collector (how many records it rejected and why) — so "offline", "401" and "the collector accepted only part of it" do not all look the same.
+- under the badge sits the upstream evidence: the HTTP status of that acknowledgement, how long ago it happened, and any `partialSuccess` note from the collector (how many records it rejected and why) — so "offline", "401" and "the collector accepted only part of it" do not all look the same;
+- conversations that never produced a single event are hidden by default (hundreds of empty rows would bury the ones that can say something) behind one line saying how many were hidden; they still count in the totals.
 
 The badge is derived from **locally recorded upstream evidence**, never from "we handed the record to the transport":
 
@@ -117,9 +118,30 @@ The badge is derived from **locally recorded upstream evidence**, never from "we
 | Partial (light gray) | an ack exists but covers a prefix | the head is in, the tail is still owed (typically a turn just ended) |
 | Not uploaded (light gray) | no ack at all | nothing was confirmed yet, or the session has not had its turn |
 
-The data does not travel through the settings document: it comes from a read-only Host route, `GET /plugin/session-log-universal/report` — GET only, loopback hosts only, `cache-control: no-store`, cached for about five seconds, at most 500 rows (the rest still count in the totals, and the page then says it lists only recent conversations). With the switch off, the page shows a banner saying uploading is switched off.
+### Where the data comes from
 
-> Why a route: the earlier design mirrored a volatile Config field to the browser, but `describe` re-reads a volatile field only when the plugin's **raw** config changes, and the watermark is written by the Host itself, so that push never happens. A table of several hundred rows also does not belong in the settings document every other surface pays for.
+The page is fed by one **read-only route** registered by the Host:
+
+```text
+GET /plugin/session-log-universal/report
+```
+
+| Property | Behaviour |
+|---|---|
+| Methods | GET only; anything else answers `405` with `allow: GET` |
+| Access | loopback only (`127.0.0.1`, `localhost`, `::1` and their port forms); a foreign `host` answers `403` — the payload carries session titles and directories and does not belong off this machine |
+| Caching | `cache-control: no-store`; the Host rebuilds roughly every 5 seconds (nothing is built while nobody watches; the idle cadence is 60 seconds) |
+| Rows | at most 500; beyond that `truncated: true`, while the totals still count **every** session and the page says it lists only recent conversations |
+| Failures | a refused build answers `500` with the diagnostic, never an empty table |
+
+Two ways to audit it:
+
+- open `http://127.0.0.1:<webserver port>/plugin/session-log-universal/report` in a browser for the raw JSON;
+- inside the desktop application the page itself is served from a custom scheme, so the client does not call `fetch` with a rooted path: it goes through the shell-provided `__DSH_TRANSPORT__.fetch` with the **document-relative** form of the same path (`plugin/session-log-universal/report`, no leading slash). One route, two ways to reach it.
+
+With the switch off, the page shows a banner saying uploading is switched off.
+
+> **Why not `configForms`:** mirroring a volatile Config field to the browser was the first design, and it cannot work — `describe` re-reads a volatile field only when the plugin's **raw** config changes, and the watermark is written by the Host itself, so that read never happens and the value is never pushed. The final split is therefore: the switch still travels through `configForms` (a user action changes the raw config and does trigger the re-read), the report travels over this route. It also keeps a table of several hundred rows out of the settings document every other surface pays for. Please keep that split when maintaining this plugin.
 
 ## Watermark and delivery semantics
 
@@ -134,19 +156,21 @@ Watermark file: **`%USERPROFILE%\.dsh\profiles\desktop\data\session-log-universa
       "at": 1762200000000,
       "code": 200,
       "note": null,
-      "failCode": 503,
-      "failAt": 1762199000000,
-      "failNote": "collector returned HTTP 503"
+      "failCode": null,
+      "failAt": null,
+      "failNote": null
     }
   }
 }
 ```
 
-- `seq` is the highest event sequence of that session that the collector **acknowledged with a 2xx**, per session, monotonic.
-- `at` is the acknowledgement time (epoch milliseconds); `code`/`note` carry the HTTP status and the collector's own explanation (`partialSuccess`, error text) — this pair is what the status page renders as upstream evidence.
-- `failCode`/`failAt`/`failNote` record the last refused attempt (a transport failure leaves `failCode` null). **A refusal never advances `seq`**; it only records the evidence, so one row can show both how far upstream confirmed and why the latest attempt failed.
+- `seq`: the highest event sequence of that session that the collector **acknowledged with a 2xx**, per session, monotonic.
+- `at`: the acknowledgement time (epoch milliseconds).
+- `code`: the HTTP status of that acknowledgement (for example `200`, `202`). A row written before this field existed is read as `200`, because only a 2xx advances `seq` — a missing status *is* a 2xx.
+- `note`: the collector's own explanation, mainly `partialSuccess` (accepted, but rejected some records); `null` when there is nothing to say. `code` + `note` together are the upstream evidence the status page renders.
+- `failCode`/`failAt`/`failNote`: the **last refused or failed attempt** (a transport failure leaves `failCode` null). A refusal **never advances `seq`**; it only records the evidence, so one row shows both how far upstream confirmed and why the latest attempt failed.
+- **Backwards compatible:** missing fields are read as `null` (`code` as `200`), so rows written with only `{seq, at}` need no migration and are never mistaken for failures; the next acknowledgement fills the receipt fields in.
 - Writes go through a temporary file and an atomic rename, coalesced to at most one per second; a failed write keeps the in-memory rows authoritative and retries on the next change.
-- Rows written by the earlier shape (only `seq`/`at`) stay valid: a missing status is read as the 2xx that advanced it.
 
 The delivery guarantee in one sentence: **the watermark only ever trails reality, never leads it.**
 
@@ -242,13 +266,46 @@ dsh-session-log-universal/
 │  └─ client.js         # Client half: browser bundle wrapped by the module loader (no build step)
 ├─ scripts/
 │  └─ sync-dev.mjs      # repository → runtime copy (idempotent; --dry-run / --check / --target)
+├─ tests/
+│  ├─ index.js          # entry for `node --test tests/`, imports both suites
+│  ├─ report.test.mjs   # report and route: self-contained, runs anywhere
+│  └─ watermark.test.mjs# watermark: needs the harness runtime, skips without it
 ├─ docs/
 │  └─ architecture.md   # both halves, their flows and contracts
-├─ package.json         # package metadata, dsh.client declaration, sync script
+├─ package.json         # package metadata, dsh.client declaration, sync / test / check scripts
 ├─ CHANGELOG.md
 ├─ LICENSE              # MIT
 ├─ README.md
 └─ README_EN.md
+```
+
+## Development
+
+No build step: `lib/index.js` and `lib/report.js` are plain ESM modules and `lib/client.js` is a browser bundle wrapped in `window.__ModuleLoader__.load({ id, factory })` — all hand-written, no bundler, no build script.
+
+The two halves do not become live the same way:
+
+| Half | How a change takes effect |
+|---|---|
+| Client (`lib/client.js`) | client-hmr watches the runtime copy's bundle, so **saving is enough**; the page remounts and React state (search text, scroll position, refresh time) resets — that is expected |
+| Host (`lib/index.js`, `lib/report.js`) | **no hot reload**: the already imported module is not re-imported, so a change needs one desktop application restart. Until then you see the mismatch — the new bundle requests `/plugin/session-log-universal/report`, the old Host never registered it, and the page reports a read failure |
+
+Daily loop:
+
+```bash
+npm run sync      # repository → runtime copy (lib/*.js and package.json), idempotent
+npm test          # node --test "tests/*.test.mjs"
+npm run check     # syntax check of the three lib files
+```
+
+The suite runs the same three ways: `npm test`, `node --test tests/` (the entry is `tests/index.js`), or a single file such as `node tests/report.test.mjs`.
+
+- `node scripts/sync-dev.mjs --dry-run` prints the plan; `--check` exits 1 on drift (suitable for a pre-commit hook); `--target <dir>` or `DSH_RUNTIME_DIR` points at another copy.
+- `tests/report.test.mjs` is fully self-contained (in-memory stubs, no fixture files, no network, no harness home): state derivation, upstream evidence, title extraction, report assembly and truncation, and the route's 200/405/403/500 answers with their headers.
+- `tests/watermark.test.mjs` covers the watermark (monotonic advance, receipt, failure evidence, atomic write and reload, legacy rows, self-healing from a corrupt file). It needs `@deepseek-ai/schemastery`, a peer that only exists inside a harness installation, so it skips itself in a plain checkout; point it at an installed copy to run it for real:
+
+```bash
+DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\lib\index.js" node tests/watermark.test.mjs
 ```
 
 ## Wire protocol

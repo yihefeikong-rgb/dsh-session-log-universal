@@ -13,6 +13,7 @@
   "files": [
     "lib/",
     "scripts/",
+    "tests/",
     "README.md",
     "README_EN.md",
     "CHANGELOG.md",
@@ -66,6 +67,7 @@
   },
   "scripts": {
     "sync": "node scripts/sync-dev.mjs",
-    "check": "node --check lib/index.js && node --check lib/report.js && node --check lib/client.js"
+    "check": "node --check lib/index.js && node --check lib/report.js && node --check lib/client.js",
+    "test": "node --test \"tests/*.test.mjs\""
   }
 }

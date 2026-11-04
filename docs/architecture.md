@@ -215,7 +215,9 @@ Report value:
 
 ### Report feed
 
-The status tab does not poll the Host config: a `ReportFeed` fetches `plugin/session-log-universal/report` (document-relative, through the page transport when one is injected) on mount and on Refresh, and publishes one immutable snapshot with `{ report, status }`. The tab renders from that snapshot, so a failed read is a visible state rather than an empty table.
+The status tab does not poll the Host config: a `ReportFeed` fetches the report route on mount and on Refresh, and publishes one immutable snapshot with `{ report, status }`. The tab renders from that snapshot, so a failed read is a visible state rather than an empty table.
+
+The request goes out as `plugin/session-log-universal/report` — the **document-relative** form, without the leading slash — through `globalThis.__DSH_TRANSPORT__.fetch` when the shell injected one, falling back to `fetch`. The desktop window is served from a custom scheme, so a rooted path is not the same origin as the Host route; the relative form is the one the shipped transport accepts. A plain browser tab reaches the identical route as `http://127.0.0.1:<port>/plugin/session-log-universal/report`.
 
 The tab renders, in order: the five totals (sessions, uploaded, partial, never, uploaded events), the generation instant, the collector endpoint, a Refresh button, a search box filtering by title / session id / directory, and one row per session:
 
@@ -227,8 +229,38 @@ The tab renders, in order: the five totals (sessions, uploaded, partial, never, 
 | badge | `state` → green 已上传 / light gray 未上传 or 部分 {acked}/{total} |
 | evidence | `upstream.code` as `HTTP nnn`, `ackedAt` as a relative time, `upstream.note` as the tooltip |
 
+Conversations that hold no event at all are filtered out of the list (a line above it says how many were hidden); they keep counting towards the totals, so the list stays a list of conversations that can actually say something about uploads.
+
 Colour is a CSS `data-state` attribute on the badge (`uploaded` uses the theme success token, `partial` and `never` share the muted surface), so the state that the Host derived is the only thing the client has to agree on.
+
+### Which half owns which state
+
+| state | transport | why |
+|---|---|---|
+| `enabled` (the switch) | `configForms` volatile form | a user action changes the raw config, which is exactly what makes `describe` re-read the volatile field and push it back |
+| the upload report | `GET /plugin/session-log-universal/report` | the watermark is written by the Host itself, so the raw config never changes and no volatile push would ever happen |
+
+Keeping these apart is the one architectural rule a maintainer must not break: moving the report into a Config field produces a page that is always empty, and moving the switch onto the route means the client can no longer write it.
 
 ### Locale and assets
 
 Two dictionaries live in the bundle (`settings.sessionLogUniversal` for the switch, `settings.sessionLogUniversalStatus` for the tab, each `en` + `zh`) and are registered during `apply`. Component styles are injected as `<style data-plugin-css="dsh-session-log-universal/UploadRow.module.css">` (and `…/UploadStatus.module.css`) tags keyed by a stable id, so hot reload replaces rather than duplicates them.
+
+---
+
+## Tests
+
+`npm test` → `node --test "tests/*.test.mjs"`, and equivalently `node --test tests/` (through `tests/index.js`) or one file on its own. No fixtures, no network, no harness home.
+
+| file | covers | runs |
+|---|---|---|
+| `tests/report.test.mjs` | `stateOf`, `upstreamOf`, `titleFromEvents`, `buildReport`, `reportHandler`, `describeResponse`, the published constants, and `emptyReport` | everywhere |
+| `tests/watermark.test.mjs` | monotonic advance, receipts, failure evidence, atomic write and reload, legacy `{seq, at}` rows, corrupt-file recovery | needs `@deepseek-ai/schemastery`, so it skips itself in a plain checkout; set `DSH_SLU_HOST_MODULE` to an installed `lib/index.js` to run it |
+
+The route handler is exercised against a fake `request`/`response` pair, which is what pins the contract the client depends on: `200` with `content-type` and `cache-control: no-store`, `405` plus `allow: GET`, `403` for a foreign authority, and `500` with the diagnostic when the build throws.
+
+## Development loop
+
+- Client changes are live: client-hmr watches the runtime copy's bundle, so saving `lib/client.js` reloads the page (React state resets).
+- Host changes are not: `lib/index.js` and `lib/report.js` are imported once, so they need a desktop application restart. Before that restart the new client asks for a route the old Host never registered and the tab shows a read failure.
+- `npm run sync` copies `lib/*.js` and `package.json` into the runtime copy the loader imports (idempotent; `--dry-run`, `--check`, `--target <dir>` or `DSH_RUNTIME_DIR`).
