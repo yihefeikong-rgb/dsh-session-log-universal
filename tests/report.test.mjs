@@ -74,7 +74,7 @@ function request(method = "GET", host = "127.0.0.1:26117") {
 test("report contract constants are the published ones", () => {
   assert.equal(REPORT_VERSION, 1);
   assert.equal(REPORT_ROUTE, "/plugin/session-log-universal/report");
-  assert.equal(REPORT_MAX_ROWS, 500);
+  assert.equal(REPORT_MAX_ROWS, 5000);
   assert.equal(TITLE_MAX_CHARS, 80);
   const empty = emptyReport();
   assert.deepEqual(empty.totals, { sessions: 0, uploaded: 0, partial: 0, never: 0, events: 0, ackedEvents: 0 });
@@ -754,6 +754,32 @@ test("buildReport: an uncapped table still lists every session, content first", 
   assert.equal(report.moreSessions, 0);
 });
 
+test("buildReport: the default cap covers the whole corpus the page filters", () => {
+  const now = 1762200000000;
+  const sessions = [];
+  // 677 conversations and 179 header-only sessions: the shape of a real corpus.
+  for (let index = 0; index < 677; index += 1) sessions.push(stored("content-" + index, 90000, now - index));
+  for (let index = 0; index < 179; index += 1) sessions.push(stored("empty-" + index, 300, now - 1000 - index, 0));
+  const report = buildReport({ now, endpoint: "x", enabled: true, sessions, ledger: {} });
+  assert.equal(report.rows.length, 856);
+  assert.equal(report.truncated, false, "nothing is hidden from the filter");
+  assert.equal(report.moreSessions, 0);
+  assert.equal(report.totals.sessions, 856);
+  // Empty sessions still come last, because the page hides them.
+  assert.equal(report.rows.slice(0, 677).every((row) => row.isEmpty === false), true);
+  assert.equal(report.rows.slice(677).every((row) => row.isEmpty === true), true);
+});
+
+test("buildReport: a corpus larger than the default cap still truncates", () => {
+  const now = 1762200000000;
+  const sessions = [];
+  for (let index = 0; index <= REPORT_MAX_ROWS; index += 1) sessions.push(stored("s-" + index, 90000, now - index));
+  const report = buildReport({ now, endpoint: "x", enabled: true, sessions, ledger: {} });
+  assert.equal(report.rows.length, REPORT_MAX_ROWS);
+  assert.equal(report.truncated, true);
+  assert.equal(report.moreSessions, 1, "one conversation did not fit");
+  assert.equal(report.totals.sessions, REPORT_MAX_ROWS + 1);
+});
 test("reportHandler: serves the report as uncached JSON", async () => {
   const value = buildReport(fixture());
   const response = fakeResponse();
