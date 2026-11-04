@@ -101,9 +101,36 @@ When the write is refused or fails in transport, the UI keeps showing the accept
 
 The page is the plugin's own tab inside the built-in plugins settings section (registered into the root list slot `settings.plugins.tab`, id `upload-status`, order 20, after the read-only plugin inventory). No official package is touched.
 
-The top of the page always holds five totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial shows 0 rather than disappearing, so the row never changes width) — with the toolbar (one-click upload, refresh, and a small line naming the current cap), the instant the data was generated and the collector endpoint. Below them: a search box (title, session id or directory) and one row per session.
+The top of the page always holds five totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial shows 0 rather than disappearing, so the row never changes width) — with the toolbar (one-click upload, refresh, and a small line naming the current cap), the instant the data was generated and the collector endpoint. Below them: a search box (title, session id or directory), one pager row, and one row per session.
 
 "Uploaded events" is `totals.ackedEvents`: the sum of the **acknowledged event counts** (a session with an unknown length contributes `ackedSeq + 1`). `totals.events` is only a **lower bound on the known counts** — historical sessions have no count, so it is often 0 — and the page does not use it as its headline number.
+
+### What the cards count (856 = 507 + 0 + 170, plus 179 empty sessions)
+
+The three state cards count **rows the list can show**: an empty conversation is never a backfill target (`selectBackfillTargets` drops it via `isEmptyOf`), so counting it as "not uploaded" would promise a number the filter cannot deliver.
+
+| Card | Scope | Real corpus |
+|---|---|---|
+| Sessions | session records on disk (**including** empty ones) | 856 |
+| Uploaded | rows with `state = uploaded` | 507 |
+| Partial | rows with `state = partial` | 0 |
+| Not uploaded | rows with `state = never` | 170 |
+| Uploaded events | the Host's cumulative acknowledgement count (`totals.ackedEvents`) | 332,831 |
+
+So **856 − 179 (empty) = 677 = 507 + 0 + 170**.
+
+The report's `totals` use a different scope — do not mix the two:
+
+| Host `totals` field | Value | Breakdown |
+|---|---|---|
+| `totals.sessions` | 856 | every session record |
+| `totals.uploaded` | **541** | 507 displayable rows + **34** empty sessions that were uploaded back when they still had content |
+| `totals.partial` | 0 | — |
+| `totals.never` | **315** | 170 displayable rows + **145** empty sessions that were never uploaded |
+
+So those 179 empty sessions are not "all unuploaded": **34 were uploaded, 145 never were**, and the two cards differ from the totals by exactly those 34 and 145.
+
+Two details: clicking "Not uploaded" filters on "state is not uploaded", so `partial` rows make the list slightly longer than the card number (with `partial = 0` today the two agree); and empty conversations take neither a row nor a card — the line `179 empty conversations hidden (no events)` is where they surface, and clicking "Not uploaded" will not show the 145 of them either, because they are not in the list.
 
 Each row shows:
 
@@ -113,15 +140,16 @@ Each row shows:
 - the badge on the right is **green = uploaded** (a 2xx covered the whole log) or **light gray = not uploaded / partial**;
 - under the badge sits the upstream evidence: the HTTP status of that acknowledgement, how long ago it happened, and any `partialSuccess` note from the collector (how many records it rejected and why) — so "offline", "401" and "the collector accepted only part of it" do not all look the same.
 
-Above the list one line reports visibility: `{visible} of {sessions} conversations shown`; with empty conversations hidden it becomes `…; {hidden} empty conversations hidden (no events)`. At the bottom, a truncated report adds `{count} conversations with content are not shown (at most 500 are listed)`.
+Above the list one line reports visibility: `677 of 856 conversations shown`; with empty conversations hidden it becomes `…; 179 empty conversations hidden (no events)`. That N is the **total after filter + search**, not the size of the current page — the page slice is stated by the pager row.
 
-- **The totals double as filters**: clicking "Uploaded" or "Not uploaded" narrows the list to that state, and clicking the same card again clears it. "Not uploaded" includes the partial rows — they are not finished either. The filter stacks with the search box, so the "N of M shown" line above counts what is really on screen, and a `Filtered: {name}` line says which filter is active.
+- **The totals double as filters**: clicking "Uploaded" or "Not uploaded" narrows the list to that state, and clicking the same card again clears it. "Not uploaded" includes the partial rows — they are not finished either. The filter stacks with the search box, so the "N of M shown" line above counts what is really on screen, and a `Filtered: {name}` line says which filter is active. The selected card switches to the theme's business accent (border, tinted fill and a 1 px inset ring, with a brighter label; the "Uploaded" number itself stays success green) and `aria-pressed` flips with it.
+- **The list is paged**: one row under the search box. On the left `1-50 of 677`, on the right the "per page" selector (**20 / 50 / 100 / 200, 50 by default**), `Previous`, `Page 1 / 14` and `Next`. Choosing a filter, editing the search or changing the page size returns to page 1; `Refresh` keeps the current page and clamps it to the valid range; an empty result renders no pager row at all. Real corpus: 677 rows / 14 pages unfiltered, 170 rows / 4 pages after clicking "Not uploaded" (last page 151-170).
 - **Toolbar**: only **One-click upload** and **Refresh**, plus one small line naming the current allowance — `up to 50 conversations / 200 MB per run`, taken from the report's `backfill.defaults`. The page does **not** expose the caps: a click always uses the Host defaults (50 conversations / 200 MiB), so sending more means clicking again. While a run is going the upload button is disabled and reads `uploading completed/sessions`; when it finishes the page says `backfilled N conversation(s) (M record(s) sent)`, adds `N failed` when some did, and keeps a separate `last upload error: …` line for the detail. Nothing to send reads `no conversations need backfilling`; an allowance too small to fit even one conversation reads `cap too small: N conversation(s) exceed the per-run byte limit`; a run already in progress reads `the previous batch is still uploading`.
 - **Progress is slow on purpose**: the report is cached for 5 seconds and is stale-while-revalidate (this request answers with the previous value while the next one is built in the background), so progress moves in **roughly 5–10 second steps**. A stalled-looking counter is normal, not a hang.
 
 **Empty conversations** (not a single event) do not take a row by default: hundreds of empty rows would bury the ones that can say something. The Host decides with `isEmpty` — `localEvents === 0`, or, when the count is unknown, a physical log size `sizeBytes <= 4096` (`EMPTY_LOG_BYTES`; measured header-only logs run up to 2231 bytes and the smallest log holding an event is 8192 bytes, so 4096 sits in the middle of the safe gap). Empty conversations still count in the totals.
 
-**Order**: sessions with content first (`isEmpty` false before true), newest write first inside each group — so the 500-row cap is spent on conversations that actually hold events.
+**Order**: sessions with content first (`isEmpty` false before true), newest write first inside each group. The report **no longer truncates rows** (see `REPORT_MAX_ROWS` below), so the order now sets the list's natural sequence and decides where the title budget goes — an empty session costs no cold title read, leaving that budget for conversations that hold events.
 
 The badge is derived from **locally recorded upstream evidence**, never from "we handed the record to the transport":
 
@@ -149,7 +177,7 @@ POST /plugin/session-log-universal/backfill
 | Methods | one handler dispatches by method: GET answers the report, POST starts a one-click backfill (below); anything else answers `405` with `allow: GET, POST` |
 | Access | loopback only (`127.0.0.1`, `localhost`, `::1` and their port forms); a foreign `host` answers `403` — the payload carries session titles and directories and does not belong off this machine |
 | Caching | `cache-control: no-store`; the same report is reused for 5 seconds. Rebuilding on the 5 s cadence happens **only while the route was read within the last 30 seconds**; with no client watching, nothing is built at all (the timer idles without doing work) |
-| Rows | at most 500, **sessions with content first**; beyond that `truncated: true` plus `moreSessions` (how many sessions that do hold content were left out of the 500). Totals still count **every** session |
+| Rows | **the whole corpus in one answer, no 500-row cut**: `REPORT_MAX_ROWS = 5000`, so the real 856-row corpus arrives complete (a 258–317 KB JSON payload) and paging is entirely a page concern. `truncated` / `moreSessions` mean what they always meant and are now almost always `false` / `0`; only a corpus above 5000 rows is cut (content first, as before) |
 | Failures | a refused build answers `500` with the diagnostic, never an empty table |
 
 Two ways to audit it:
@@ -275,7 +303,7 @@ Four ways to verify what is sent and what the upstream side received:
 curl -s http://127.0.0.1:<GUI port>/plugin/session-log-universal/report
 ```
 
-   It returns `totals` and `rows` (`state` is `uploaded`/`partial`/`never`, `upstream` carries the `code`/`at`/`note` of the acknowledgement).
+   It returns `totals` and `rows` (`state` is `uploaded`/`partial`/`never`, `upstream` carries the `code`/`at`/`note` of the acknowledgement) — about 258–317 KB for 856 rows; to see only the unuploaded ones, click the card in the page or filter the JSON by `state`.
 3. **Read the log**: normally the install-time `uploading every session log to …` line; on problems warnings such as `collector returned HTTP <status>`, `upload queue is full` or `record … exceeds maxRequestBytes`.
 4. **Capture one request end to end**: point `config.url` at a local server, for example
 
@@ -399,10 +427,11 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - A single event larger than `maxRequestBytes` (4 MB by default) cannot be split; it is skipped with a warning.
 - Non-2xx 4xx answers (except 429) are treated as a permanent refusal of that batch: the records stay unacknowledged for a later replay, so a wrong `url` retries and warns forever.
 - Historical sessions have no known event count (the JSONL backend's `list()` returns no `eventCount`); only live sessions have a real count. For an unknown count the page falls back to comparing the acknowledgement time with the log's last write, with a 60 second grace window (see the badge table above).
-- The status page lists at most 500 sessions and prefers sessions that hold content (totals still count every session); the number left out is published as `moreSessions` and shown at the bottom of the list.
+- **The report no longer truncates at 500 rows** (`REPORT_MAX_ROWS = 5000`, one full answer), which removes the illusion a 500-row "most recent first" cut created. Clicking "Not uploaded" and seeing 0 was exactly that bug: the 500 rows were ordered by recent activity, sessions that had just been backfilled filled the quota, and the old unuploaded ones never entered the payload. Now all 856 rows are there and the "Not uploaded" filter finds 170.
+- The price is bandwidth: a full report is roughly 258–317 KB (856 rows including the 5 s cache snapshot) over loopback only — no traffic leaves the machine. Only beyond 5000 sessions does `truncated` / `moreSessions` matter again.
 - The status page needs the Host web server: a composition without `webServer` (headless, ACP) keeps uploading, but the route is absent and the page reports a read failure.
 - Meaningful for the web profile only (`dsh.client.platform: web`); headless and ACP profiles have no settings UI and keep only the Host-side upload.
-- **Backfill scale**: on the development machine, 613 of 856 sessions are eligible (non-empty, unconfirmed); the default caps (50 sessions / 200 MiB) cover 50 sessions in one run, about 54 MiB, with `skipped` at 611. The **session cap is the bottleneck** there — the 200 MiB byte cap needs roughly 380 median-sized (562 KiB) sessions to fill, and since the page does not expose the caps, sending more means clicking again (each click takes the 50 most owed conversations at that moment).
+- **Backfill scale**: on the development machine about **613** of 856 sessions were eligible at first (non-empty, unconfirmed); the default caps (50 sessions / 200 MiB) cover 50 sessions in one run, about 54 MiB, with `skipped` at 611. Backfilled sessions leave the candidate set — after a few runs "not uploaded" is down to **170**, the number the card shows — so each click takes the 50 most owed at that moment. The **session cap is the bottleneck**: the 200 MiB byte cap needs roughly 380 median-sized (562 KiB) sessions to fill, and since the page does not expose the caps, sending more means clicking again.
 - Backfill progress moves in 5–10 second steps (5 s report cache plus stale-while-revalidate), and one run only covers the sessions it selected; the rest wait for the next click.
 
 ## License

@@ -65,6 +65,25 @@ All notable changes to this project are documented here. The format follows
   plugin does no report work at all. Because a request is answered with the
   previous value while the next one builds, backfill progress is reported in
   5–10 second steps.
+- The report no longer truncates at 500 rows: `REPORT_MAX_ROWS` is 5000, so the
+  whole corpus (856 sessions, a 258–317 KB JSON payload) arrives in one answer
+  and the page pages it. That 500-row cut was the root cause of "Not uploaded"
+  showing zero — the 500 rows were ordered by recent activity, so sessions that
+  had just been backfilled filled the quota and the old unuploaded ones never
+  entered the payload. `truncated` / `moreSessions` keep their meaning and now
+  only fire above 5000 sessions.
+- The status list is paged: 20 / 50 / 100 / 200 rows per page (50 by default),
+  with a range line and page buttons. Filter, search and page size reset to page
+  1, a refresh keeps the page and clamps it, and an empty result renders no pager.
+- The three state cards now count only the rows the list can show, so the numbers
+  add up: 856 − 179 empty = 677 = 507 uploaded + 0 partial + 170 not uploaded.
+  Counting empty sessions as "not uploaded" promised rows the filter could never
+  deliver.
+- A selected filter card paints with the business accent (border, tinted fill,
+  1 px inset ring, brighter label) instead of looking like an unselected one.
+- Empty sessions no longer consume the title budget: a session the list hides is
+  skipped before its cold title read, so the 32 titles per rebuild land on rows
+  that are actually shown.
 - Titles: 96 events scanned per log, 32 new titles per rebuild (96 on the first
   build), so a freshly opened page fills 500 rows in about a minute.
 - `package.json` is publishable (`private: false`, `files`, `exports`,

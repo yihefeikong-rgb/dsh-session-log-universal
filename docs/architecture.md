@@ -141,9 +141,9 @@ A manual re-send drops the queued copies of that session first, so the re-read c
 
 - A `SessionReport` answers from a cached value and rebuilds at most every `REPORT_REFRESH_MILLIS` (5 s), and only while somebody is reading: a tick does nothing unless the route was requested within `REPORT_ACTIVE_MILLIS` (30 s). A plugin nobody opened performs no report work at all — the timer wakes, sees no reader and returns.
 - Sources: `sessionPersistence.list()` for stored session headers, sizes and revisions (cached for `INVENTORY_CACHE_MILLIS`, 10 s), `ctx.sessions.list()` for live sessions (which answer from memory and therefore never trail their own log), the watermark rows for the acknowledgement, a directory sweep of `<DSH_HOME>/sessions/*/session*.jsonl` for activity timestamps and physical sizes (cached for `STORAGE_SCAN_MILLIS`, 30 s), and a bounded log read for titles.
-- Titles: each read scans the first `TITLE_SCAN_EVENTS` (96) events of a log; a normal rebuild resolves `TITLE_BATCH` (32) new titles, the very first rebuild `TITLE_FIRST_BATCH` (96). The cache is per process and retries an empty title after `TITLE_RETRY_MILLIS` (60 s), so a page that has just opened fills its 500 rows over roughly a minute instead of showing short ids for minutes.
+- Titles: each read scans the first `TITLE_SCAN_EVENTS` (96) events of a log; a normal rebuild resolves `TITLE_BATCH` (32) new titles, the very first rebuild `TITLE_FIRST_BATCH` (96). A session the page hides (an empty log) is skipped before the read, so the budget lands only on rows that will be shown. The cache is per process and retries an empty title after `TITLE_RETRY_MILLIS` (60 s), so a page that has just opened fills its list over roughly a minute instead of showing short ids for minutes.
 - **Event counts are only known for live sessions.** The shipped JSONL backend's `list()` returns header / `sizeBytes` / `revision` and no `eventCount` (that field is "provided when the backend can do it cheaply"), so a stored session reports `localEvents: null` and `localSeq: null`. `totals.events` is therefore a **lower bound** over the known counts, while `totals.ackedEvents` counts the acknowledged prefix of every session (unknown-length ones contribute `ackedSeq + 1`).
-- **Publish order**: sessions that hold events before empty ones, newest write first inside each group (`orderSessions`). At most `REPORT_MAX_ROWS` (500) rows are published, so the cap is spent on conversations; `truncated` says the table was cut, `moreSessions` says how many sessions **with content** fell outside it.
+- **Publish order**: sessions that hold events before empty ones, newest write first inside each group (`orderSessions`). The whole corpus is published — `REPORT_MAX_ROWS` is 5000, so the 856-row development corpus (258–317 KB of JSON) arrives in one answer and the page does the paging. `truncated` / `moreSessions` still describe a cut table and still prefer sessions with content, but only a corpus above 5000 rows reaches them. Cutting at 500 was what made "Not uploaded" show zero: 500 rows ordered by recent activity were mostly already-backfilled sessions.
 - **Emptiness** is decided once, in `isEmptyOf`: `localEvents === 0`, or — when the count is unknown — `sizeBytes <= EMPTY_LOG_BYTES` (4096). That bound is measured, not derived: across 856 logs on the development machine, header-only logs run up to 2231 bytes (older generations) while the smallest log holding an event is 8192 bytes.
 - `state` is derived, not stored:
 
@@ -155,7 +155,17 @@ A manual re-send drops the queued copies of that session first, so the re-read c
 | count unknown, `updatedAt > ackedAt + PARTIAL_GRACE_MILLIS` (60 000 ms) | `partial` |
 | count unknown, otherwise | `uploaded` |
 
-  The grace window covers the uploader's flush delay plus the round trip, so an ordinary turn is not mistaken for an owed tail while a genuinely newer write still is. Totals count every session, so a truncated table still answers "how much of the corpus is uploaded".
+  The grace window covers the uploader's flush delay plus the round trip, so an ordinary turn is not mistaken for an owed tail while a genuinely newer write still is.
+
+  `totals` counts **every** session, empty ones included, because it describes the corpus. Cross-tabulating the 856 rows of the development machine by `isEmpty` × `state` gives:
+
+| | uploaded | never | total |
+|---|---|---|---|
+| content | 507 | 170 | 677 |
+| empty | 34 | 145 | 179 |
+| total | 541 | 315 | 856 |
+
+  The page's three state cards deliberately count only the rows the list can show (507 / 0 / 170), while `totals.uploaded` (541) and `totals.never` (315) include the empty sessions — 34 of those did get uploaded while they still had content, which is why the two scopes differ by 34 and 145 rather than by the whole 179. Keep that split when changing the client: a card that counted empty sessions would promise rows the filter cannot deliver, and a totals field that excluded them would stop describing the corpus.
 
 The routes:
 
@@ -175,8 +185,8 @@ Report value:
   "generatedAt": 1762200000000,
   "endpoint": "https://dsh-otel-collector.deepseeksvc.com/v1/logs",
   "enabled": true,
-  "truncated": true,
-  "moreSessions": 137,
+  "truncated": false,
+  "moreSessions": 0,
   "backfill": {
     "running": false, "startedAt": 1762195000000, "finishedAt": 1762195001800,
     "sessions": 50, "bytes": 56623104, "completed": 50, "failed": 0,
@@ -184,7 +194,7 @@ Report value:
     "limits": { "maxSessions": 50, "maxBytes": 209715200 },
     "defaults": { "maxSessions": 50, "maxBytes": 209715200 }
   },
-  "totals": { "sessions": 856, "uploaded": 690, "partial": 3, "never": 163, "events": 412, "ackedEvents": 5310 },
+  "totals": { "sessions": 856, "uploaded": 541, "partial": 0, "never": 315, "events": 9287, "ackedEvents": 333216 },
   "rows": [
     {
       "sessionId": "5f0c...1a", "title": "Fix the flaky reconciliation test",
@@ -208,7 +218,7 @@ Report value:
 }
 ```
 
-The first row is a stored session: its length is unknown, so the state came from the timestamps. The second row is live in memory, so it carries a real count — and its receipt shows a `207` with the collector's `partialSuccess` note. `totals.events` (412) counts only the sessions whose length is known, which is why the page headlines `ackedEvents` instead. `backfill` sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports).
+The numbers are the real ones from the development machine: 856 sessions, `truncated: false` and `moreSessions: 0` because nothing is cut any more. `totals.uploaded` (541) and `totals.never` (315) are whole-corpus counts that include the empty sessions, while the page's cards show the 507 / 0 / 170 rows it can list. `totals.events` (9,287) is a lower bound over the sessions whose length is known — a stored session has no `eventCount`, so most of the corpus contributes nothing — which is why the page headlines `ackedEvents` (333,216 here, and it grows with activity) instead. `backfill` sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports).
 
 ### 8. One-click backfill
 
@@ -301,7 +311,19 @@ The status tab does not poll the Host config: a `ReportFeed` fetches the report 
 
 The request goes out as `plugin/session-log-universal/report` — the **document-relative** form, without the leading slash — through `globalThis.__DSH_TRANSPORT__.fetch` when the shell injected one, falling back to `fetch`. The desktop window is served from a custom scheme, so a rooted path is not the same origin as the Host route; the relative form is the one the shipped transport accepts. A plain browser tab reaches the identical route as `http://127.0.0.1:<port>/plugin/session-log-universal/report`.
 
-The tab renders, in order: five fixed totals (sessions, uploaded, partial, never, **uploaded events** = `totals.ackedEvents`) with two of them acting as filter buttons, the toolbar (one-click upload, refresh, and the default-allowance line built from `backfill.defaults`), the last-run result line, the generation instant, the collector endpoint, one line of visibility counters, the search box (title / session id / directory), the row list, and — when the report was cut — a line saying how many conversations with content are not shown (`moreSessions`). The five cards are always rendered: a card that vanished when its count reached zero would reflow the row and hide the fact that the state exists.
+The tab renders, in order: five fixed totals with two of them acting as filter buttons, the toolbar (one-click upload, refresh, and the default-allowance line built from `backfill.defaults`), the last-run result line, the generation instant, the collector endpoint, one line of visibility counters, the search box (title / session id / directory), the pager row, the current page of rows, and — when the report was cut — a line saying how many conversations with content are not shown (`moreSessions`, always 0 below 5000 sessions). The five cards are always rendered: a card that vanished when its count reached zero would reflow the row and hide the fact that the state exists.
+
+What each card counts differs on purpose:
+
+| card | value | scope |
+|---|---|---|
+| sessions | `totals.sessions` | every session record on disk, empty ones included |
+| uploaded / partial / never | the client's own tally over `visible` | only rows the list can show — an empty session is never a backfill target, so counting it would promise rows the filter cannot deliver |
+| uploaded events | `totals.ackedEvents` | the Host's cumulative acknowledgement count |
+
+That is why `totals.never` (315) and the "Not uploaded" card (170) disagree by exactly the 145 empty sessions that were never uploaded — and `totals.uploaded` (541) exceeds the "Uploaded" card (507) by the other 34 empty ones — while 856 − 179 = 507 + 0 + 170 holds either way.
+
+The list is paged in the tab, not by the Host: `pageSize` starts at 50 and offers 20 / 50 / 100 / 200; `total` is the row count after filter and search; the range line reads `{from}-{to} of {total}`, the page buttons read `Page {page} / {pages}` and disable at the ends; choosing a filter, editing the search or changing the page size resets to page 1, while a refresh keeps the page and clamps it to the new page count; an empty result renders no pager at all. The selected card carries `data-active` and paints with the business accent (border, tinted fill, 1 px inset ring, brighter label), with `aria-pressed` mirroring the filter.
 
 | row part | source |
 |---|---|
@@ -311,7 +333,7 @@ The tab renders, in order: five fixed totals (sessions, uploaded, partial, never
 | badge | `state` → green 已上传 / light gray 未上传, or 部分 {acked}/{total} 条 when the count is known and plain 部分上传 when it is not |
 | evidence | `upstream.code` as `HTTP nnn`, `ackedAt` as a relative time, `upstream.note` as the tooltip |
 
-Interaction state lives entirely in the tab: `filter` (`all` / `uploaded` / `pending`), the search text, and the two cap inputs. "Not uploaded" filters on `state !== "uploaded"`, so the partial rows stay with it — they are not finished either. Filter and search compose, and the visibility line counts what survives both, which is why it is computed from the filtered rows rather than from `totals`.
+Interaction state lives entirely in the tab: `filter` (`all` / `uploaded` / `pending`), the search text, `page` and `pageSize`. "Not uploaded" filters on `state !== "uploaded"`, so partial rows stay with it — which is why that list can be slightly longer than the card number, and why the visibility line counts filtered rows rather than `totals`.
 
 The one-click button posts a fixed body — `{ maxSessions: null, maxBytes: null }` — and then re-reads the report, so the run always takes the Host defaults; a `200` starts the run, `409` means another run is still going, `400` surfaces the Host's own message (bad limit, oversized body, uploading off). While `backfill.running` is true the button is disabled and reads `uploading completed/sessions`; the tab polls the report every `REPORT_REFRESH_MILLIS`, so that counter advances in 5–10 second steps rather than continuously. When the run ends, the result line distinguishes "backfilled N conversations" from "nothing to backfill" (`sessions === 0 && skipped === 0`) and from "the cap is too small for any single conversation" (`sessions === 0 && skipped > 0`).
 
