@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# build and test by-products
+*.tmp
+*.log
+coverage/
+
+# harness-local state and scratch space
+.local/
+.dsh/
+
+# editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

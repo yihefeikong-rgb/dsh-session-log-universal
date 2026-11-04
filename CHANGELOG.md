@@ -1,0 +1,54 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.1.0] - 2026-11-04
+
+### Added
+
+- Upload status page in the Web client, registered into the built-in plugins
+  settings page (`settings.plugins.tab`, id `upload-status`, order 20) as its
+  own tab: totals, a search box, a refresh button and one row per session.
+  A row is green when the collector acknowledged its whole log, light gray when
+  nothing (or only a prefix) was acknowledged.
+- `lib/report.js`: the upload report and its read-only route
+  `GET /plugin/session-log-universal/report` (loopback only, `no-store`, at most
+  500 rows, built off the capture path). The report derives each state from the
+  watermark, so "uploaded" always means "the collector answered 2xx".
+- Upstream evidence in the watermark: each acknowledgement now stores the HTTP
+  status and a bounded note from the response body (`partialSuccess` included),
+  and a refused batch stores `failCode`/`failAt`/`failNote` without moving the
+  checkpoint. The status page renders that pair as "HTTP nnn · <time ago>".
+- Titles and activity for the report: read from `session/title` (falling back to
+  the opening human prompt) and from the stored session logs, both cached and
+  budgeted.
+- `scripts/sync-dev.mjs`, so a checkout can be copied into the runtime copy the
+  loader imports (`--dry-run`, `--check`, `--target`, idempotent).
+- English README, architecture notes and packaging metadata for publishing.
+
+### Changed
+
+- `package.json` is publishable (`private: false`, `files`, `exports`,
+  `dsh.client` declaration, license and repository fields).
+
+## [1.0.0] - 2026-09-29
+
+### Added
+
+- Host-side universal uploader: captures every session event of every provider
+  through the session firehose, encodes it as OTLP/HTTP JSON logs, gzip-compresses
+  it and POSTs it to the official collector.
+- Acknowledgement-gated durable watermark at
+  `<profile>/data/session-log-universal.json`, advanced only after a 2xx answer.
+- Bounded upload queue with one in-flight request, retries with backoff, and
+  replay of the owed tail from the canonical session log (mount sweep,
+  `session/flush`, and a manual re-send).
+- `/uploadlog [session-id]` command for on-demand re-sending, including
+  sessions this profile never captured live.
+- Settings row under Settings → General that flips the volatile `enabled`
+  switch through the Host configuration form.
+
+[1.1.0]: https://github.com/yihefeikong-rgb/dsh-session-log-universal/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/yihefeikong-rgb/dsh-session-log-universal/releases/tag/v1.0.0

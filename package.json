@@ -1,0 +1,71 @@
+{
+  "name": "dsh-session-log-universal",
+  "version": "1.1.0",
+  "private": false,
+  "description": "Upload every DeepSeek Harness session log to the official OTLP collector, whichever model provider drove the conversation.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "scripts/",
+    "README.md",
+    "README_EN.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs/"
+  ],
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "session-log",
+    "telemetry",
+    "opentelemetry",
+    "otlp",
+    "observability"
+  ],
+  "author": "yihefeikong-rgb",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yihefeikong-rgb/dsh-session-log-universal"
+  },
+  "homepage": "https://github.com/yihefeikong-rgb/dsh-session-log-universal#readme",
+  "bugs": {
+    "url": "https://github.com/yihefeikong-rgb/dsh-session-log-universal/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "sync": "node scripts/sync-dev.mjs",
+    "check": "node --check lib/index.js && node --check lib/report.js && node --check lib/client.js"
+  }
+}
