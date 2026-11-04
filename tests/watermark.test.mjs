@@ -11,7 +11,7 @@
  * `tests/report.test.mjs` carry the coverage that always runs.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, test } from "node:test";
@@ -98,6 +98,16 @@ test("watermark: a refused attempt records evidence without advancing", { skip }
   assert.equal(ledger.rows.s2.seq, undefined);
 });
 
+test("watermark: the ledger is readable by its owner only", {
+  skip: skip || (process.platform === "win32" ? "file modes are POSIX-only" : false),
+}, () => {
+  const { path, ledger } = freshLedger("mode");
+  ledger.advance("s1", 3, { code: 200, note: null });
+  ledger.flush();
+  // The ledger names conversations that reached the collector, and the profile it
+  // sits beside may be shared, so the file must not be world-readable.
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+});
 test("watermark: flush persists atomically and reloads", { skip }, () => {
   const { path, ledger } = freshLedger("persist");
   ledger.advance("s1", 9, { code: 202, note: "accepted" });

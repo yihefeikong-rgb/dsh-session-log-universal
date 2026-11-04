@@ -28,19 +28,30 @@ DSH 自带的那一行 `@deepseek-ai/dsh-session-log-deepseek` 走的是**请求
 
 ## 安装
 
-前置条件：DSH 桌面版（web profile，0.2.x）。插件需要能被 Node 从 profile 目录解析到，所以有下面两种放法，任选其一。
+前置条件：DSH 桌面版（web profile，0.2.x）。插件需要能被 Node 从 profile 目录解析到，安装有两种放法，**任选其一**。
 
-### 方式 A：装成 profile 依赖（推荐，可升级）
+### 方式 A：作为组合包装进 profile（推荐：会出现在「插件」页面里，可开关、可卸载）
 
-1. 在 profile 的 `package.json` 里加一条依赖（路径换成你 clone 的位置；Windows 下用正斜杠）：
+这个包本身就是一个 profile 组合包：`package.json` 声明了 `dsh.bundle.patch = ./cordis.patch.yml`，那份 patch 里就一行 loader 行（`id` / `name` 都是 `dsh-session-log-universal`）。所以只要把它列进 profile 的组合包列表，加载器就会自己插好那一行——**不需要再手改 profile 的 `cordis.patch.yml`**。
+
+1. 在 profile 的 `package.json` 里加依赖（路径换成你 clone 的位置；Windows 下用正斜杠）：
 
 ```json
 {
   "dependencies": {
     "dsh-session-log-universal": "link:D:/dev/dsh-session-log-universal"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "dsh-session-log-universal"
+      ]
+    }
   }
 }
 ```
+
+   （`dsh.profile.bundles` 是已存在的数组，往里面**追加**一项，别把原来的组合包覆盖掉。）
 
 2. 在 profile 目录里安装（该 profile 用 pnpm）：
 
@@ -48,6 +59,8 @@ DSH 自带的那一行 `@deepseek-ai/dsh-session-log-deepseek` 走的是**请求
 cd %USERPROFILE%\.dsh\profiles\desktop
 pnpm install
 ```
+
+> 「插件」设置页列的就是 `dsh.profile.bundles`，所以走这条路之后，插件会像市场里的插件一样出现在那一页，可以开关、可以卸载；只靠手写 patch 行装进去的插件不会出现在那里。
 
 ### 方式 B：直接放进 harness home（本仓库开发时用的就是这种）
 
@@ -61,11 +74,11 @@ node scripts/sync-dev.mjs --dry-run   # 只看计划，不写盘
 node scripts/sync-dev.mjs --check     # 有漂移就退出码 1，适合放进预提交钩子
 ```
 
-脚本只写运行副本的 `package.json` 和 `lib/*.js`，别的什么都不动；`lib/` 里已经不存在的旧 `.js` 会被删掉，免得加载器按路径导入到废弃代码。可用 `--target <dir>` 或环境变量 `DSH_RUNTIME_DIR` 指定别的副本。
+脚本只写运行副本的 `package.json`、`cordis.patch.yml` 和 `lib/*.js`（`cordis.patch.yml` 是组合包的 patch，加载器从包根读它），别的什么都不动；`lib/` 里已经不存在的旧 `.js` 会被删掉，免得加载器按路径导入到废弃代码。可用 `--target <dir>` 或环境变量 `DSH_RUNTIME_DIR` 指定别的副本。
 
-### 然后：在 profile 的 cordis.patch.yml 里插一行
+### 然后（仅方式 B，或没把包列进 `dsh.profile.bundles` 时）：在 profile 的 cordis.patch.yml 里插一行
 
-编辑 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`（这是用户自己的 tweak 层，应用在所有 bundle 层之后）：
+方式 A 由包自带的 patch 完成这一行，**不要再手写一遍**——同一个 `id` 插两次会得到两条同名 loader 行。手动装（方式 B）时，编辑 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`（这是用户自己的 tweak 层，应用在所有 bundle 层之后）：
 
 ```yaml
 - insert:
@@ -115,7 +128,7 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
 | 已上传 | 列表里 `state = uploaded` 的行 | 507 |
 | 部分上传 | 列表里 `state = partial` 的行 | 0 |
 | 未上传 | 列表里 `state = never` 的行 | 170 |
-| 已上传事件 | Host 累计确认条数（`totals.ackedEvents`） | 332,831 |
+| 已上传事件 | Host 累计确认条数（`totals.ackedEvents`） | 332,831（快照，随活动增长） |
 
 也就是 **856 − 179（空会话）= 677 = 507 + 0 + 170**。
 
@@ -175,7 +188,7 @@ POST /plugin/session-log-universal/backfill
 | 项 | 行为 |
 |---|---|
 | 方法 | 同一个 handler 按 method 分派：GET 返回报告、POST 启动一键补传（见下）；其它方法返回 `405`（带 `allow: GET, POST`） |
-| 访问范围 | 只服务回环地址（`127.0.0.1` / `localhost` / `::1` 及其端口写法）；其它 `host` 返回 `403` —— 响应里带会话标题和目录，不该出本机 |
+| 访问范围 | 只服务回环地址（`127.0.0.1` / `localhost` / `::1` 及其端口写法）；其它 `host` 返回 `403` —— 响应里带会话标题和目录，不该出本机。自称跨站的请求（`Sec-Fetch-Site` 既不是 `same-origin` 也不是 `none`）同样 `403`：这个头浏览器无法伪造，能挡住别的标签页发起的 `no-cors` 请求；curl 之类不带该头的客户端不受影响 |
 | 缓存 | 响应头 `cache-control: no-store`；同一份报告在 5 秒内被复用。**只有在过去 30 秒内被读过**才会按 5 秒节奏重建，没有任何客户端在看就完全不构建（定时器空转，不花 CPU） |
 | 行数 | **一次返回全部会话，不再截断到 500 行**：`REPORT_MAX_ROWS = 5000`，真实语料 856 行全量给出（约 258~317 KB 的 JSON），分页完全由页面负责。`truncated` / `moreSessions` 语义没变，只是现在几乎恒为 `false` / `0`，只有语料超过 5000 行才会截断（截断时仍**有内容的会话优先**） |
 | 失败 | 报告构建失败返回 `500` 和诊断信息，而不是一张空表 |
@@ -195,7 +208,7 @@ POST /plugin/session-log-universal/backfill
 
 这是**写操作**，启动一次“批量补传未上传的会话”。同一个 handler 按 method 分派：GET 返回报告、POST 启动补传，所以 `GET /backfill` 也返回报告、`POST /report` 同样能启动补传——同一个命名空间里的同一能力，不是为了多开权限面。
 
-请求体是可空 JSON（`content-type` 不强制，但非空 body 必须能解析）：
+请求体是可空 JSON；**`content-type` 必须是 `application/json`**（带 `; charset=utf-8` 也行），否则返回 `415` —— 这条与上面的跨站守卫一起，保证只有本机页面或命令行能启动补传。非空 body 还必须能解析：
 
 ```json
 { "maxSessions": 50, "maxBytes": 209715200 }
@@ -212,7 +225,8 @@ POST /plugin/session-log-universal/backfill
 | 已经有一批在跑 | `409` + 同一份快照 |
 | 限额越界 / 非整数 / 坏 JSON / body > 4096 字节 | `400` + `{"error": "..."}` |
 | 上传开关已关闭 | `400` |
-| 非回环地址 | `403` |
+| 非回环地址，或请求自称跨站 | `403` |
+| POST 的 `content-type` 不是 `application/json` | `415` + `{"error": "content-type must be application/json"}` |
 | 非 GET/POST | `405` + `allow: GET, POST` |
 
 **选目标的规则**：所有已存会话里 `stateOf(...) !== "uploaded"` 且 `!isEmptyOf(...)` 的那些（`partial` 的尾巴也算在内，反正它没传完），按 `updatedAt` 倒序，两个限额**任一先到即停**，没选中的差额计入 `skipped`。
@@ -235,7 +249,7 @@ POST /plugin/session-log-universal/backfill
 
 `limits` 是**这次运行实际用的**额度，`defaults` 是 Host 发布的**默认额度**（界面用它显示工具栏那句小字，所以即使某次运行带了自定义 `limits`，小字也不会跟着变）。没跑过时 `running: false`、计数全 0、两者都是默认值。
 
-> 想自己跑一次而不点界面：`curl -X POST http://127.0.0.1:<webserver 端口>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'`，响应就是补传开始时的快照。
+> 想自己跑一次而不点界面：`curl -X POST http://127.0.0.1:<webserver 端口>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'`（`-H` 不能省，否则 415），响应就是补传开始时的快照。
 
 开关关掉时页面顶部会显示一条“上传开关已关闭，新事件不会再上传”的提示。
 
@@ -320,14 +334,19 @@ node -e "require('http').createServer((q,s)=>{let n=0;q.on('data',c=>n+=c.length
 按顺序做，前两步就能止住上传，后面是清理痕迹：
 
 1. **关开关**：设置 → 通用 → 「上传全部会话日志（插件提供）」关掉。立刻停发，不用重启。
-2. **删 patch 行**：在 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 里删掉 `- insert:` 那三行（`id: dsh-session-log-universal` 那条）。patch 层热重载，或重启 DSH 生效。
+2. **摘掉 loader 行**——看你是怎么装的：
+
+   - **方式 A（组合包）**：把 `dsh-session-log-universal` 从 profile `package.json` 的 `dsh.profile.bundles` 里删掉（「插件」设置页里关掉/卸载也行），再删掉那条依赖并 `pnpm install`。包自带的 `cordis.patch.yml` 随之不再应用。
+   - **方式 B（手写 patch）**：在 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 里删掉 `- insert:` 那三行（`id: dsh-session-log-universal` 那条）。
+
+   patch / 组合包层都会热重载，或重启 DSH 生效。
 3. **删运行副本**：
 
 ```bat
 rmdir /s /q "%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal"
 ```
 
-（如果你走的是方式 A，则删掉 profile `package.json` 里那条依赖，再 `pnpm install`。）
+（走方式 A 的话，这一步的依赖已经在第 2 步删掉了；这里只清残留目录。）
 
 4. **删水位线**（可选，删掉等于忘记“哪些已经传过”）：
 
@@ -372,7 +391,8 @@ dsh-session-log-universal/
 │  └─ watermark.test.mjs# 水位线：需要 harness 运行环境，否则自动 skip
 ├─ docs/
 │  └─ architecture.md   # Host / Client 两侧的流程与契约
-├─ package.json         # 包元数据、dsh.client 声明、sync / test / check 脚本
+├─ cordis.patch.yml     # 组合包 patch：一行 loader 行（dsh.bundle.patch 指向它）
+├─ package.json         # 包元数据、dsh.bundle / dsh.client 声明、sync / test / check 脚本
 ├─ CHANGELOG.md
 ├─ LICENSE              # MIT
 ├─ README.md
@@ -433,7 +453,7 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - 代价是带宽：全量报告约 258~317 KB（856 行，含 5 秒缓存快照），每次读取都走本机回环，不产生出口流量；只有超过 5000 个会话才会重新走 `truncated` / `moreSessions` 那套。
 - 状态页依赖 Host 的 web 服务器：没有 `webServer` 的组合（headless/ACP）上传照旧，但那条只读路由不存在，页面会显示读取失败。
 - 只对 web profile 有意义（`dsh.client.platform: web`）；headless/ACP 等没有设置界面，只剩 Host 侧上传。
-- **一键补传的规模**：这台机器 856 个会话里可补传（非空且未确认）**最初约 613 个**；默认限额（50 会话 / 200 MiB）一次覆盖 50 个、约 54 MiB、`skipped` 611。补传过的会话会从候选里消失——跑过几轮之后，未上传从 613 掉到 **170**（就是卡片上那个数），所以“每次都挑当时最欠的 50 个”。这里**会话数是瓶颈**：200 MiB 的字节上限要大约 380 个中位大小（562 KiB）的会话才吃满；界面不给改额度，想多传就多点几次「一键上传」。
+- **一键补传的规模**（以下都是写文档时的一次快照，会随补传和新会话变化）：这台机器 856 个会话里可补传（非空且未确认）**最初约 613 个**；默认限额（50 会话 / 200 MiB）一次覆盖 50 个、约 54 MiB、当时 `skipped` 611。补传过的会话会从候选里消失——跑过几轮之后，未上传从 613 掉到 **170**（就是卡片上那个数），所以“每次都挑当时最欠的 50 个”。这里**会话数是瓶颈**：200 MiB 的字节上限要大约 380 个中位大小（562 KiB）的会话才吃满；界面不给改额度，想多传就多点几次「一键上传」。
 - 补传进度是慢节奏的（报告 5 秒缓存 + stale-while-revalidate，最快 5~10 秒一跳），而且一次运行只覆盖当次选中的会话，剩下的下次再点。
 
 ## 许可

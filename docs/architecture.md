@@ -1,6 +1,8 @@
 # Architecture
 
-The plugin is one Cordis row with two halves that never call each other directly:
+The plugin ships as a profile **bundle**: `package.json` declares `dsh.bundle.patch = ./cordis.patch.yml`, and that five-line patch is what inserts the single loader row, so listing the package in `dsh.profile.bundles` is enough to mount it (and to make it appear on the Plugins page).
+
+That row has two halves that never call each other directly:
 
 - **Host half** (`lib/index.js`, `lib/report.js`) — Node modules the harness imports. They capture session events, encode OTLP, upload, own the durable watermark, and publish a read-only upload report.
 - **Client half** (`lib/client.js`) — one browser bundle registered through `window.__ModuleLoader__.load({ id, factory })`. It renders the Settings switch and the upload status tab, and reads the report over HTTP.
@@ -173,11 +175,11 @@ The routes:
 |---|---|
 | paths | `REPORT_ROUTE` = `/plugin/session-log-universal/report` and `BACKFILL_ROUTE` = `/plugin/session-log-universal/backfill`, both an exact match, both registered with the *same* handler through `ctx.inject(["webServer"], ...)` on a child context |
 | methods | one handler dispatches by method: GET publishes the report, POST starts a backfill. Anything else answers `405` with `allow: GET, POST`. Because both paths share the handler, `GET /backfill` also publishes the report and `POST /report` also starts a run — one capability in one namespace, not a widened surface |
-| access | loopback `host` header only (403 otherwise) — the payload carries session titles and working directories, and POST is a write |
+| access | loopback `host` header only (403 otherwise) — the payload carries session titles and working directories, and POST is a write. `sec-fetch-site` is checked too: anything other than `same-origin` / `none` is refused with 403, because a browser cannot forge that header and it is the only signal a `no-cors` request from a foreign page gives. A request without the header (curl, a test) falls through to the authority check |
 | caching | `cache-control: no-store`, `content-length`; the value is reused for `REPORT_REFRESH_MILLIS` (5 s) and rebuilt only while the route was read within `REPORT_ACTIVE_MILLIS` (30 s); a request during that window gets the previous value while the next one builds (stale-while-revalidate, so progress moves in 5–10 s steps). A refused build answers 500 with the diagnostic instead of an empty table |
 | absent web server | uploading keeps working, the routes simply do not exist; a conflicting registration is a warning, not a failure |
 
-Report value:
+Report value. **The row fields below are placeholders**: a session id, its title and its working directory are private, so the sample keeps the shape and the counts, not the content.
 
 ```json
 {
@@ -197,8 +199,8 @@ Report value:
   "totals": { "sessions": 856, "uploaded": 541, "partial": 0, "never": 315, "events": 9287, "ackedEvents": 333216 },
   "rows": [
     {
-      "sessionId": "5f0c...1a", "title": "Fix the flaky reconciliation test",
-      "cwd": "D:\\work\\billing", "parentSession": null,
+      "sessionId": "<session-id>", "title": "<title>",
+      "cwd": "<cwd>", "parentSession": null,
       "updatedAt": 1762200000000,
       "localSeq": null, "localEvents": null, "sizeBytes": 184320, "isEmpty": false,
       "ackedSeq": 211, "ackedAt": 1762199950000,
@@ -206,8 +208,8 @@ Report value:
       "state": "uploaded"
     },
     {
-      "sessionId": "77b2...9c", "title": null,
-      "cwd": "D:\\work\\billing", "parentSession": "5f0c...1a",
+      "sessionId": "<child-session-id>", "title": null,
+      "cwd": "<cwd>", "parentSession": "<session-id>",
       "updatedAt": 1762199000000,
       "localSeq": 40, "localEvents": 41, "sizeBytes": 23347, "isEmpty": false,
       "ackedSeq": 12, "ackedAt": 1762198800000,
@@ -218,7 +220,9 @@ Report value:
 }
 ```
 
-The numbers are the real ones from the development machine: 856 sessions, `truncated: false` and `moreSessions: 0` because nothing is cut any more. `totals.uploaded` (541) and `totals.never` (315) are whole-corpus counts that include the empty sessions, while the page's cards show the 507 / 0 / 170 rows it can list. `totals.events` (9,287) is a lower bound over the sessions whose length is known — a stored session has no `eventCount`, so most of the corpus contributes nothing — which is why the page headlines `ackedEvents` (333,216 here, and it grows with activity) instead. `backfill` sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports).
+The counts are **one real snapshot** from the development machine, taken at a single moment while that machine kept uploading; the row fields above are placeholders, so only the shape and the counts are borrowed. Concretely: 856 sessions, `truncated: false` and `moreSessions: 0` because nothing is cut any more. `totals.uploaded` (541) and `totals.never` (315) are whole-corpus counts that include the empty sessions, while the page's cards show the 507 / 0 / 170 rows it can list. `totals.events` (9,287) is a lower bound over the sessions whose length is known — a stored session has no `eventCount`, so most of the corpus contributes nothing — which is why the page headlines `ackedEvents` instead.
+
+Two fields move with activity, so other numbers in these docs come from other moments and are not a contradiction: `ackedEvents` is a running counter (333,216 here; the README quotes 332,831 from an earlier snapshot), and the `backfill` block — which sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports) — reports a 50-session, ~54 MiB run whose `skipped` was 562 when it finished, while the README quotes 611 from a run started when more sessions were pending.
 
 ### 8. One-click backfill
 
@@ -235,6 +239,7 @@ The numbers are the real ones from the development machine: 856 sessions, `trunc
 | `maxSessions` | integer 1..500; `null` or absent → `DEFAULT_BACKFILL_SESSIONS` (50) |
 | `maxBytes` | integer 1 MiB..2 GiB; `null` or absent → `DEFAULT_BACKFILL_BYTES` (200 MiB) |
 | body size | above `BACKFILL_BODY_MAX_BYTES` (4096) the read stops and the request is refused |
+| content type | must be `application/json` (a `charset` parameter is accepted); anything else, including no header, answers `415`. Together with the `sec-fetch-site` guard this is what keeps the write to this machine's own page or a command line |
 
 | outcome | answer |
 |---|---|
@@ -243,7 +248,8 @@ The numbers are the real ones from the development machine: 856 sessions, `trunc
 | a run is already going | `409` + the snapshot (with `running: true`) |
 | bad JSON, non-integer or out-of-range limit, oversized body | `400` + `{ error }` |
 | uploading switched off | `400` |
-| non-loopback request | `403` |
+| non-loopback request, or one that declares itself cross-site | `403` |
+| POST whose content type is not `application/json` | `415` |
 | any method other than GET/POST | `405` + `allow: GET, POST` |
 
 Selection (`selectBackfillTargets`): eligible means a stored session where `!isEmptyOf(...)` **and** `stateOf(...) !== "uploaded"` — a `partial` session still owes its tail. Eligible sessions are ordered by `updatedAt` descending, both caps apply at once, and the run stops at whichever is reached first; `skipped` is eligible minus chosen. One deliberate conservative case: if the **first** candidate alone exceeds `maxBytes`, the run selects **zero** sessions rather than squeezing an oversized one in — one deferred conversation is cheaper than one blown-up request.

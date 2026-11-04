@@ -14,9 +14,10 @@ All notable changes to this project are documented here. The format follows
   A row is green when the collector acknowledged its whole log, light gray when
   nothing (or only a prefix) was acknowledged.
 - `lib/report.js`: the upload report and its read-only route
-  `GET /plugin/session-log-universal/report` (loopback only, `no-store`, at most
-  500 rows, built off the capture path). The report derives each state from the
-  watermark, so "uploaded" always means "the collector answered 2xx".
+  `GET /plugin/session-log-universal/report` (loopback only, `no-store`, the whole
+  session list up to `REPORT_MAX_ROWS` = 5000 rows, built off the capture path).
+  The report derives each state from the watermark, so "uploaded" always means
+  "the collector answered 2xx".
 - Upstream evidence in the watermark: each acknowledgement now stores the HTTP
   status and a bounded note from the response body (`partialSuccess` included),
   and a refused batch stores `failCode`/`failAt`/`failNote` without moving the
@@ -81,11 +82,21 @@ All notable changes to this project are documented here. The format follows
   deliver.
 - A selected filter card paints with the business accent (border, tinted fill,
   1 px inset ring, brighter label) instead of looking like an unselected one.
+- Shipped as a profile bundle: `package.json` declares `dsh.bundle.patch`
+  (`./cordis.patch.yml`, one loader row), so the plugin can be installed by
+  listing it in `dsh.profile.bundles` — which is also what makes the Plugins
+  page able to show, toggle and remove it. A hand-written patch row still works
+  but keeps the plugin out of that page, so the two are alternatives, not steps.
+- The report route is guarded for a public install: a request that declares itself
+  cross-site (`Sec-Fetch-Site` other than `same-origin` / `none`) is refused with
+  403, and the backfill POST additionally requires `content-type:
+  application/json` (415 otherwise). Both checks leave curl and the app's own
+  page working while a foreign tab cannot trigger a write.
 - Empty sessions no longer consume the title budget: a session the list hides is
   skipped before its cold title read, so the 32 titles per rebuild land on rows
   that are actually shown.
 - Titles: 96 events scanned per log, 32 new titles per rebuild (96 on the first
-  build), so a freshly opened page fills 500 rows in about a minute.
+  build), so a freshly opened page fills its list in about a minute.
 - `package.json` is publishable (`private: false`, `files`, `exports`,
   `dsh.client` declaration, license and repository fields).
 

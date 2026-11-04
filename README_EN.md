@@ -28,9 +28,11 @@ The built-in switch and the official row are complementary: with both on, an off
 
 ## Install
 
-Requires DSH Desktop (web profile, 0.2.x). Node has to resolve the package from the profile directory, so pick one of the two layouts below.
+Requires DSH Desktop (web profile, 0.2.x). Node has to resolve the package from the profile directory, so pick **one** of the two layouts below.
 
-### Option A: install it as a profile dependency (recommended, upgradeable)
+### Option A: install it as a profile bundle (recommended: it then appears on the Plugins page, where it can be toggled and removed)
+
+The package is itself a profile bundle: `package.json` declares `dsh.bundle.patch = ./cordis.patch.yml`, and that patch holds the single loader row (`id` and `name` are both `dsh-session-log-universal`). Listing the package in the profile's bundle list is enough — the loader inserts that row itself, so **the profile's `cordis.patch.yml` needs no edit**.
 
 1. Add the dependency to the profile's `package.json` (point it at your clone; use forward slashes on Windows):
 
@@ -38,9 +40,18 @@ Requires DSH Desktop (web profile, 0.2.x). Node has to resolve the package from 
 {
   "dependencies": {
     "dsh-session-log-universal": "link:D:/dev/dsh-session-log-universal"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "dsh-session-log-universal"
+      ]
+    }
   }
 }
 ```
+
+   (`dsh.profile.bundles` already exists — **append** this entry, do not replace the other bundles.)
 
 2. Install inside the profile directory (that profile uses pnpm):
 
@@ -48,6 +59,8 @@ Requires DSH Desktop (web profile, 0.2.x). Node has to resolve the package from 
 cd %USERPROFILE%\.dsh\profiles\desktop
 pnpm install
 ```
+
+> The Plugins settings page lists `dsh.profile.bundles` and nothing else, so this route also makes the plugin visible there, toggleable and removable like a market plugin — a plugin mounted only by a hand-written patch row never shows up on that page.
 
 ### Option B: drop it into the harness home (what this repository uses during development)
 
@@ -61,11 +74,11 @@ node scripts/sync-dev.mjs --dry-run   # print the plan, write nothing
 node scripts/sync-dev.mjs --check     # exit 1 on drift, suitable for a pre-commit hook
 ```
 
-The script writes only `package.json` and `lib/*.js` of the runtime copy and touches nothing else; a stale `.js` file in `lib/` that no longer exists here is deleted, so the loader cannot import abandoned code. Use `--target <dir>` or `DSH_RUNTIME_DIR` to point at a different copy.
+The script writes only `package.json`, `cordis.patch.yml` and `lib/*.js` of the runtime copy (the patch is the bundle's own layer, read from the package root) and touches nothing else; a stale `.js` file in `lib/` that no longer exists here is deleted, so the loader cannot import abandoned code. Use `--target <dir>` or `DSH_RUNTIME_DIR` to point at a different copy.
 
-### Then: insert one row into the profile cordis.patch.yml
+### Then (option B only, or when the package is not listed in `dsh.profile.bundles`): insert one row into the profile cordis.patch.yml
 
-Edit `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` (your own tweak layer, applied after every bundle layer):
+Option A already inserts that row through the bundle's own patch — do **not** write it again, or the same `id` ends up as two loader rows. For a manual install (option B), edit `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` (your own tweak layer, applied after every bundle layer):
 
 ```yaml
 - insert:
@@ -115,7 +128,7 @@ The three state cards count **rows the list can show**: an empty conversation is
 | Uploaded | rows with `state = uploaded` | 507 |
 | Partial | rows with `state = partial` | 0 |
 | Not uploaded | rows with `state = never` | 170 |
-| Uploaded events | the Host's cumulative acknowledgement count (`totals.ackedEvents`) | 332,831 |
+| Uploaded events | the Host's cumulative acknowledgement count (`totals.ackedEvents`) | 332,831 (a snapshot; it grows with activity) |
 
 So **856 − 179 (empty) = 677 = 507 + 0 + 170**.
 
@@ -175,7 +188,7 @@ POST /plugin/session-log-universal/backfill
 | Property | Behaviour |
 |---|---|
 | Methods | one handler dispatches by method: GET answers the report, POST starts a one-click backfill (below); anything else answers `405` with `allow: GET, POST` |
-| Access | loopback only (`127.0.0.1`, `localhost`, `::1` and their port forms); a foreign `host` answers `403` — the payload carries session titles and directories and does not belong off this machine |
+| Access | loopback only (`127.0.0.1`, `localhost`, `::1` and their port forms); a foreign `host` answers `403` — the payload carries session titles and directories and does not belong off this machine. A request that declares itself cross-site (`Sec-Fetch-Site` set to anything other than `same-origin` or `none`) is also `403`: a page cannot forge that header, so it stops a `no-cors` call from another tab, while clients such as curl send no such header and are unaffected |
 | Caching | `cache-control: no-store`; the same report is reused for 5 seconds. Rebuilding on the 5 s cadence happens **only while the route was read within the last 30 seconds**; with no client watching, nothing is built at all (the timer idles without doing work) |
 | Rows | **the whole corpus in one answer, no 500-row cut**: `REPORT_MAX_ROWS = 5000`, so the real 856-row corpus arrives complete (a 258–317 KB JSON payload) and paging is entirely a page concern. `truncated` / `moreSessions` mean what they always meant and are now almost always `false` / `0`; only a corpus above 5000 rows is cut (content first, as before) |
 | Failures | a refused build answers `500` with the diagnostic, never an empty table |
@@ -195,7 +208,7 @@ POST /plugin/session-log-universal/backfill
 
 This is a **write**: it starts one run that backfills the conversations the collector has not fully confirmed. The handler dispatches by method — GET answers the report, POST starts a backfill — so `GET /backfill` also returns the report and `POST /report` also starts a run. One capability in one namespace, not a widened permission surface.
 
-The body is optional JSON (the content type is not enforced, but a non-empty body must parse):
+The body is optional JSON, and **the content type must be `application/json`** (a `; charset=utf-8` parameter is fine) — anything else answers `415`, which together with the cross-site guard leaves the write reachable only from this machine's own page or a command line. A non-empty body must parse:
 
 ```json
 { "maxSessions": 50, "maxBytes": 209715200 }
@@ -212,7 +225,8 @@ The page's "One-click upload" always sends `{"maxSessions": null, "maxBytes": nu
 | A run is already going | `409` + the same snapshot |
 | Out-of-range or non-integer limit, bad JSON, body > 4096 bytes | `400` + `{"error": "..."}` |
 | Uploading switched off | `400` |
-| Not a loopback request | `403` |
+| Not loopback, or the request declares itself cross-site | `403` |
+| POST without `content-type: application/json` | `415` + `{"error": "content-type must be application/json"}` |
 | Method other than GET/POST | `405` + `allow: GET, POST` |
 
 **What it picks**: every stored conversation where `stateOf(...) !== "uploaded"` and `!isEmptyOf(...)` — a `partial` session owes its tail, so it counts — newest write first, stopping at whichever of the two caps is reached first. Whatever is left out is counted in `skipped`.
@@ -235,7 +249,7 @@ The report carries the run as a new top-level field `backfill` (key order: after
 
 `limits` is what **this run** used; `defaults` is the allowance the Host publishes, which the toolbar line renders — so a run started with custom limits does not change the small print. Before the first run: `running: false`, every counter 0, both at the defaults.
 
-> To drive it without the UI: `curl -X POST http://127.0.0.1:<webserver port>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'`, and the answer is the snapshot the run started with.
+> To drive it without the UI: `curl -X POST http://127.0.0.1:<webserver port>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'` (the `-H` is required, otherwise `415`), and the answer is the snapshot the run started with.
 
 With the switch off, the page shows a banner saying uploading is switched off.
 
@@ -318,14 +332,19 @@ node -e "require('http').createServer((q,s)=>{let n=0;q.on('data',c=>n+=c.length
 In order; the first two steps already stop the uploads, the rest removes the traces:
 
 1. **Turn the switch off**: Settings → General → "Upload Session Log for every conversation (plugin-provided)". Immediate, no restart.
-2. **Delete the patch row**: remove the `- insert:` block (`id: dsh-session-log-universal`) from `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`. The patch layer hot-reloads; otherwise restart DSH.
+2. **Remove the loader row** — how depends on the install:
+
+   - **Option A (bundle)**: drop `dsh-session-log-universal` from `dsh.profile.bundles` in the profile `package.json` (or toggle/remove it on the Plugins page), then remove the dependency and run `pnpm install`. The package's own `cordis.patch.yml` stops applying with it.
+   - **Option B (hand-written patch)**: remove the `- insert:` block (`id: dsh-session-log-universal`) from `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`.
+
+   Patch and bundle layers both hot-reload; otherwise restart DSH.
 3. **Delete the runtime copy**:
 
 ```bat
 rmdir /s /q "%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal"
 ```
 
-   (With option A, remove the dependency from the profile `package.json` and run `pnpm install` instead.)
+   (On option A the dependency is already gone after step 2; this step only clears the leftover directory.)
 
 4. **Delete the watermark** (optional — it only means forgetting what was uploaded already):
 
@@ -370,7 +389,8 @@ dsh-session-log-universal/
 │  └─ watermark.test.mjs# watermark: needs the harness runtime, skips without it
 ├─ docs/
 │  └─ architecture.md   # both halves, their flows and contracts
-├─ package.json         # package metadata, dsh.client declaration, sync / test / check scripts
+├─ cordis.patch.yml     # bundle patch: the single loader row (dsh.bundle.patch points here)
+├─ package.json         # package metadata, dsh.bundle / dsh.client declaration, sync / test / check scripts
 ├─ CHANGELOG.md
 ├─ LICENSE              # MIT
 ├─ README.md
@@ -431,7 +451,7 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - The price is bandwidth: a full report is roughly 258–317 KB (856 rows including the 5 s cache snapshot) over loopback only — no traffic leaves the machine. Only beyond 5000 sessions does `truncated` / `moreSessions` matter again.
 - The status page needs the Host web server: a composition without `webServer` (headless, ACP) keeps uploading, but the route is absent and the page reports a read failure.
 - Meaningful for the web profile only (`dsh.client.platform: web`); headless and ACP profiles have no settings UI and keep only the Host-side upload.
-- **Backfill scale**: on the development machine about **613** of 856 sessions were eligible at first (non-empty, unconfirmed); the default caps (50 sessions / 200 MiB) cover 50 sessions in one run, about 54 MiB, with `skipped` at 611. Backfilled sessions leave the candidate set — after a few runs "not uploaded" is down to **170**, the number the card shows — so each click takes the 50 most owed at that moment. The **session cap is the bottleneck**: the 200 MiB byte cap needs roughly 380 median-sized (562 KiB) sessions to fill, and since the page does not expose the caps, sending more means clicking again.
+- **Backfill scale** (all of these are one snapshot from the moment these docs were written; they move with new sessions and backfills): on the development machine about **613** of 856 sessions were eligible at first (non-empty, unconfirmed); the default caps (50 sessions / 200 MiB) cover 50 sessions in one run, about 54 MiB, and `skipped` stood at 611 then. Backfilled sessions leave the candidate set — after a few runs "not uploaded" is down to **170**, the number the card shows — so each click takes the 50 most owed at that moment. The **session cap is the bottleneck**: the 200 MiB byte cap needs roughly 380 median-sized (562 KiB) sessions to fill, and since the page does not expose the caps, sending more means clicking again.
 - Backfill progress moves in 5–10 second steps (5 s report cache plus stale-while-revalidate), and one run only covers the sessions it selected; the rest wait for the next click.
 
 ## License

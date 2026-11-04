@@ -596,6 +596,62 @@ test("reportHandler: POST is refused when uploading is off", async () => {
   assert.deepEqual(JSON.parse(response.body.toString("utf8")), { error: "session-log-universal is off" });
 });
 
+/** A request stub carrying an explicit Sec-Fetch-Site declaration. */
+function siteRequest(site, method = "GET", type = "application/json") {
+  const headers = { host: "127.0.0.1:26117" };
+  if (site !== undefined) headers["sec-fetch-site"] = site;
+  if (type !== undefined && type !== null) headers["content-type"] = type;
+  const bytes = Buffer.from(JSON.stringify({ maxSessions: 2 }), "utf8");
+  return {
+    method,
+    headers,
+    async *[Symbol.asyncIterator]() {
+      yield bytes;
+    },
+  };
+}
+
+test("reportHandler: a request that declares itself cross-site is refused", async () => {
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, stubBackfill({ status: 200, started: false, snapshot: emptyBackfill() }));
+  // A `no-cors` POST from another page cannot hide this header.
+  for (const site of ["cross-site", "same-site", "Cross-Site"]) {
+    const response = fakeResponse();
+    await handler(siteRequest(site, "POST"), response);
+    assert.equal(response.statusCode, 403, site);
+    assert.deepEqual(JSON.parse(response.body.toString("utf8")), { error: "cross-site requests are refused" });
+  }
+  // The page itself and a direct navigation are both fine.
+  for (const site of ["same-origin", "none"]) {
+    const response = fakeResponse();
+    await handler(siteRequest(site, "POST"), response);
+    assert.equal(response.statusCode, 200, site);
+  }
+  // curl and the tests send no such header at all.
+  const bare = fakeResponse();
+  await handler(siteRequest(undefined, "POST"), bare);
+  assert.equal(bare.statusCode, 200);
+});
+
+test("reportHandler: POST requires a JSON content type", async () => {
+  const backfill = stubBackfill({ status: 200, started: false, snapshot: emptyBackfill() });
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, backfill);
+  // Exactly what a cross-site form or `no-cors` fetch can send.
+  for (const type of ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "application/json-seq", null]) {
+    const response = fakeResponse();
+    await handler(siteRequest("same-origin", "POST", type), response);
+    assert.equal(response.statusCode, 415, String(type));
+    assert.deepEqual(JSON.parse(response.body.toString("utf8")), { error: "content-type must be application/json" });
+  }
+  // A browser same-origin fetch sends the charset parameter too.
+  const accepted = fakeResponse();
+  await handler(siteRequest("same-origin", "POST", "application/json; charset=utf-8"), accepted);
+  assert.equal(accepted.statusCode, 200);
+  assert.deepEqual(backfill.limits, [{ maxSessions: 2, maxBytes: DEFAULT_BACKFILL_BYTES }]);
+  // GET never needs a content type.
+  const report = fakeResponse();
+  await handler({ method: "GET", headers: { host: "127.0.0.1:26117" } }, report);
+  assert.equal(report.statusCode, 200);
+});
 test("reportHandler: POST obeys the loopback guard and the method list", async () => {
   const handler = reportHandler({ report: async () => emptyReport() }, quiet, stubBackfill({ status: 200, started: false, snapshot: emptyBackfill() }));
   const foreign = fakeResponse();
