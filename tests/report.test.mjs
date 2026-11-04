@@ -335,7 +335,9 @@ function stored(id, sizeBytes, updatedAt, localEvents = null) {
 }
 
 test("parseBackfillLimits: an absent or empty body means the published defaults", () => {
-  const defaults = { limits: { maxSessions: DEFAULT_BACKFILL_SESSIONS, maxBytes: DEFAULT_BACKFILL_BYTES } };
+  // No count limit by default: only the byte budget bounds a run.
+  assert.equal(DEFAULT_BACKFILL_SESSIONS, null);
+  const defaults = { limits: { maxSessions: null, maxBytes: DEFAULT_BACKFILL_BYTES } };
   assert.deepEqual(parseBackfillLimits(undefined), defaults);
   assert.deepEqual(parseBackfillLimits(""), defaults);
   assert.deepEqual(parseBackfillLimits("   "), defaults);
@@ -350,6 +352,8 @@ test("parseBackfillLimits: out-of-range and malformed bodies are refused with a 
   assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: 501 })).error, /maxSessions/);
   assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: 2.5 })).error, /maxSessions/);
   assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: "10" })).error, /maxSessions/);
+  // An explicit count is still accepted; only the default is unlimited.
+  assert.deepEqual(parseBackfillLimits(JSON.stringify({ maxSessions: 3 })).limits, { maxSessions: 3, maxBytes: DEFAULT_BACKFILL_BYTES });
   assert.match(parseBackfillLimits(JSON.stringify({ maxBytes: 1024 })).error, /maxBytes/);
   assert.match(parseBackfillLimits(JSON.stringify({ maxBytes: 2147483649 })).error, /maxBytes/);
   assert.match(parseBackfillLimits("{not json").error, /not valid JSON/);
@@ -411,11 +415,48 @@ test("selectBackfillTargets: activity order is newest first", () => {
   assert.deepEqual(selection.targets.map((target) => target.sessionId), ["new", "mid", "old"]);
 });
 
-test("selectBackfillTargets: missing limits fall back to the defaults", () => {
+test("selectBackfillTargets: no count limit by default, only the byte budget", () => {
   const sessions = Array.from({ length: 60 }, (_, index) => stored("s" + index, 5000, 1000 - index));
+  // 300 KB total, far below the default 200 MiB budget: every session is taken.
   const selection = selectBackfillTargets(sessions, {}, {});
-  assert.equal(selection.targets.length, DEFAULT_BACKFILL_SESSIONS);
-  assert.equal(selection.skipped, 10);
+  assert.equal(selection.targets.length, 60);
+  assert.equal(selection.bytes, 300000);
+  assert.equal(selection.skipped, 0);
+  // The same holds when the limits object omits maxSessions explicitly.
+  const explicit = selectBackfillTargets(sessions, {}, { maxSessions: null, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.equal(explicit.targets.length, 60);
+});
+
+test("selectBackfillTargets: size still decides how many sessions a run covers", () => {
+  const now = 1762200000000;
+  // 200 owed conversations, 20 MiB in total: no count cap, so all of them fit.
+  const small = Array.from({ length: 200 }, (_, index) => stored("small-" + index, 104857.6, now - index));
+  const fits = selectBackfillTargets(small, {}, {});
+  assert.equal(fits.targets.length, 200);
+  assert.equal(fits.skipped, 0);
+  assert.ok(fits.bytes <= DEFAULT_BACKFILL_BYTES);
+
+  // The same 200 conversations at 2 MiB each: 400 MiB total, so the budget stops it.
+  const large = Array.from({ length: 200 }, (_, index) => stored("large-" + index, 2097152, now - index));
+  const capped = selectBackfillTargets(large, {}, {});
+  assert.equal(capped.targets.length, 100);
+  assert.equal(capped.bytes, 209715200);
+  assert.ok(capped.bytes <= DEFAULT_BACKFILL_BYTES);
+  assert.equal(capped.skipped, 100);
+
+  // An explicit count still applies on top of the budget.
+  const counted = selectBackfillTargets(large, {}, { maxSessions: 3 });
+  assert.equal(counted.targets.length, 3);
+  assert.equal(counted.skipped, 197);
+});
+
+test("selectBackfillTargets: one log larger than the whole budget is skipped, not fatal", () => {
+  const now = 1762200000000;
+  const sessions = [stored("huge", 300 * 1024 * 1024, now), stored("normal", 1048576, now - 1)];
+  const selection = selectBackfillTargets(sessions, {}, {});
+  assert.deepEqual(selection.targets.map((target) => target.sessionId), ["normal"]);
+  assert.equal(selection.bytes, 1048576);
+  assert.equal(selection.skipped, 1);
 });
 
 /** A runner over in-memory sources, with the per-session step recorded. */

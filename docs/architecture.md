@@ -191,10 +191,10 @@ Report value. **The row fields below are placeholders**: a session id, its title
   "moreSessions": 0,
   "backfill": {
     "running": false, "startedAt": 1762195000000, "finishedAt": 1762195001800,
-    "sessions": 50, "bytes": 56623104, "completed": 50, "failed": 0,
-    "skipped": 562, "sentRecords": 858, "lastError": null,
-    "limits": { "maxSessions": 50, "maxBytes": 209715200 },
-    "defaults": { "maxSessions": 50, "maxBytes": 209715200 }
+    "sessions": 365, "bytes": 205520896, "completed": 365, "failed": 0,
+    "skipped": 248, "sentRecords": 20318, "lastError": null,
+    "limits": { "maxSessions": null, "maxBytes": 209715200 },
+    "defaults": { "maxSessions": null, "maxBytes": 209715200 }
   },
   "totals": { "sessions": 856, "uploaded": 541, "partial": 0, "never": 315, "events": 9287, "ackedEvents": 333216 },
   "rows": [
@@ -222,7 +222,7 @@ Report value. **The row fields below are placeholders**: a session id, its title
 
 The counts are **one real snapshot** from the development machine, taken at a single moment while that machine kept uploading; the row fields above are placeholders, so only the shape and the counts are borrowed. Concretely: 856 sessions, `truncated: false` and `moreSessions: 0` because nothing is cut any more. `totals.uploaded` (541) and `totals.never` (315) are whole-corpus counts that include the empty sessions, while the page's cards show the 507 / 0 / 170 rows it can list. `totals.events` (9,287) is a lower bound over the sessions whose length is known — a stored session has no `eventCount`, so most of the corpus contributes nothing — which is why the page headlines `ackedEvents` instead.
 
-Two fields move with activity, so other numbers in these docs come from other moments and are not a contradiction: `ackedEvents` is a running counter (333,216 here; the README quotes 332,831 from an earlier snapshot), and the `backfill` block — which sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports) — reports a 50-session, ~54 MiB run whose `skipped` was 562 when it finished, while the README quotes 611 from a run started when more sessions were pending.
+Two fields move with activity, so other numbers in these docs come from other moments and are not a contradiction: `ackedEvents` is a running counter (333,216 here; the README quotes 332,831 from an earlier snapshot), and the `backfill` block — which sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports) — shows a run that stopped on the byte budget rather than on a count: 365 sessions, ~196 MiB of logs, and 248 eligible conversations left for the next click.
 
 ### 8. One-click backfill
 
@@ -231,12 +231,12 @@ Two fields move with activity, so other numbers in these docs come from other mo
 `POST /plugin/session-log-universal/backfill`, optional JSON body:
 
 ```json
-{ "maxSessions": 50, "maxBytes": 209715200 }
+{ "maxSessions": null, "maxBytes": 209715200 }
 ```
 
 | field | rule |
 |---|---|
-| `maxSessions` | integer 1..500; `null` or absent → `DEFAULT_BACKFILL_SESSIONS` (50) |
+| `maxSessions` | `null` = **no count limit** (the default, `DEFAULT_BACKFILL_SESSIONS = null`); an explicit count must be an integer 1..500 |
 | `maxBytes` | integer 1 MiB..2 GiB; `null` or absent → `DEFAULT_BACKFILL_BYTES` (200 MiB) |
 | body size | above `BACKFILL_BODY_MAX_BYTES` (4096) the read stops and the request is refused |
 | content type | must be `application/json` (a `charset` parameter is accepted); anything else, including no header, answers `415`. Together with the `sec-fetch-site` guard this is what keeps the write to this machine's own page or a command line |
@@ -252,7 +252,9 @@ Two fields move with activity, so other numbers in these docs come from other mo
 | POST whose content type is not `application/json` | `415` |
 | any method other than GET/POST | `405` + `allow: GET, POST` |
 
-Selection (`selectBackfillTargets`): eligible means a stored session where `!isEmptyOf(...)` **and** `stateOf(...) !== "uploaded"` — a `partial` session still owes its tail. Eligible sessions are ordered by `updatedAt` descending, both caps apply at once, and the run stops at whichever is reached first; `skipped` is eligible minus chosen. One deliberate conservative case: if the **first** candidate alone exceeds `maxBytes`, the run selects **zero** sessions rather than squeezing an oversized one in — one deferred conversation is cheaper than one blown-up request.
+Selection (`selectBackfillTargets`): eligible means a stored session where `!isEmptyOf(...)` **and** `stateOf(...) !== "uploaded"` — a `partial` session still owes its tail. Eligible sessions are ordered by `updatedAt` descending and the run is truncated **by bytes only**: it stops when the next conversation would push the total past `maxBytes`, and `skipped` is eligible minus chosen. `maxSessions` is a gate only when a caller asks for one (`null` = unlimited, the default).
+
+One oversized log cannot stall the run: a conversation whose own size exceeds `maxBytes` is skipped (and counted in `skipped`) while the loop keeps scanning, so the smaller ones behind it still go. The earlier behaviour — a single oversized first candidate turning the run into zero sessions — is gone; `sessions: 0` with `skipped > 0` now means every candidate exceeded the budget on its own.
 
 Execution (`SessionBackfill.run`) is serial and yields between sessions:
 
@@ -268,9 +270,9 @@ for each target:                      (newest activity first)
 
 A session that throws is counted in `failed` and the run continues; `lastError` keeps the detail. `sentRecords` is the difference of the uploader's counter across the run, so it reports what actually left rather than what was planned.
 
-The state is published in the report as `backfill`: `{ running, startedAt, finishedAt, sessions, bytes, completed, failed, skipped, sentRecords, lastError, limits, defaults }`, where `limits` is what the run used and `defaults` is the allowance this Host publishes (`defaultBackfillLimits()`, always re-read at snapshot time). Its freshness is bounded by the report cache — that is why the client polls once per `REPORT_REFRESH_MILLIS` and progress moves in 5–10 second steps.
+The state is published in the report as `backfill`: `{ running, startedAt, finishedAt, sessions, bytes, completed, failed, skipped, sentRecords, lastError, limits, defaults }`, where `limits` is what the run used and `defaults` is the allowance this Host publishes (`defaultBackfillLimits()`, always re-read at snapshot time). In both, `maxSessions: null` means **no count limit** and only `maxBytes` bounds a run. Its freshness is bounded by the report cache — that is why the client polls once per `REPORT_REFRESH_MILLIS` and progress moves in 5–10 second steps.
 
-`limits` and `defaults` are published separately on purpose: the UI shows the default allowance as small print next to the button and never builds its own, so a run started by a script with custom limits does not change what the page promises. The caps stay validated at the API boundary even though the page stopped exposing them — an out-of-range body is still `400`, not silently clamped.
+`limits` and `defaults` are published separately on purpose: the UI shows the default allowance as small print next to the button and never builds its own, so a run started by a script with custom limits does not change what the page promises. The limits stay validated at the API boundary even though the page stopped exposing them — an out-of-range body (bytes outside 1 MiB..2 GiB, or an explicit count outside 1..500) is still `400`, not silently clamped.
 
 ### 9. Configuration surface
 

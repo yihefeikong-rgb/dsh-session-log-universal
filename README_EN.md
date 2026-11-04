@@ -157,7 +157,7 @@ Above the list one line reports visibility: `677 of 856 conversations shown`; wi
 
 - **The totals double as filters**: clicking "Uploaded" or "Not uploaded" narrows the list to that state, and clicking the same card again clears it. "Not uploaded" includes the partial rows — they are not finished either. The filter stacks with the search box, so the "N of M shown" line above counts what is really on screen, and a `Filtered: {name}` line says which filter is active. The selected card switches to the theme's business accent (border, tinted fill and a 1 px inset ring, with a brighter label; the "Uploaded" number itself stays success green) and `aria-pressed` flips with it.
 - **The list is paged**: one row under the search box. On the left `1-50 of 677`, on the right the "per page" selector (**20 / 50 / 100 / 200, 50 by default**), `Previous`, `Page 1 / 14` and `Next`. Choosing a filter, editing the search or changing the page size returns to page 1; `Refresh` keeps the current page and clamps it to the valid range; an empty result renders no pager row at all. Real corpus: 677 rows / 14 pages unfiltered, 170 rows / 4 pages after clicking "Not uploaded" (last page 151-170).
-- **Toolbar**: only **One-click upload** and **Refresh**, plus one small line naming the current allowance — `up to 50 conversations / 200 MB per run`, taken from the report's `backfill.defaults`. The page does **not** expose the caps: a click always uses the Host defaults (50 conversations / 200 MiB), so sending more means clicking again. While a run is going the upload button is disabled and reads `uploading completed/sessions`; when it finishes the page says `backfilled N conversation(s) (M record(s) sent)`, adds `N failed` when some did, and keeps a separate `last upload error: …` line for the detail. Nothing to send reads `no conversations need backfilling`; an allowance too small to fit even one conversation reads `cap too small: N conversation(s) exceed the per-run byte limit`; a run already in progress reads `the previous batch is still uploading`.
+- **Toolbar**: only **One-click upload** and **Refresh**, plus one small line naming the current allowance — `up to 200 MB per run` (**size only, no conversation cap**), taken from the report's `backfill.defaults`. The page does **not** expose the limits: a click always uses the Host default (200 MiB, as many conversations as fit). While a run is going the upload button is disabled and reads `uploading completed/sessions`; when it finishes the page says `backfilled N conversation(s) (M record(s) sent)`, adds `N failed` when some did, and keeps a separate `last upload error: …` line for the detail. Nothing to send reads `no conversations need backfilling`; an allowance too small to fit even one conversation reads `cap too small: N conversation(s) exceed the per-run byte limit`; a run already in progress reads `the previous batch is still uploading`.
 - **Progress is slow on purpose**: the report is cached for 5 seconds and is stale-while-revalidate (this request answers with the previous value while the next one is built in the background), so progress moves in **roughly 5–10 second steps**. A stalled-looking counter is normal, not a hang.
 
 **Empty conversations** (not a single event) do not take a row by default: hundreds of empty rows would bury the ones that can say something. The Host decides with `isEmpty` — `localEvents === 0`, or, when the count is unknown, a physical log size `sizeBytes <= 4096` (`EMPTY_LOG_BYTES`; measured header-only logs run up to 2231 bytes and the smallest log holding an event is 8192 bytes, so 4096 sits in the middle of the safe gap). Empty conversations still count in the totals.
@@ -211,12 +211,12 @@ This is a **write**: it starts one run that backfills the conversations the coll
 The body is optional JSON, and **the content type must be `application/json`** (a `; charset=utf-8` parameter is fine) — anything else answers `415`, which together with the cross-site guard leaves the write reachable only from this machine's own page or a command line. A non-empty body must parse:
 
 ```json
-{ "maxSessions": 50, "maxBytes": 209715200 }
+{ "maxSessions": null, "maxBytes": 209715200 }
 ```
 
-Both fields may be `null` or absent, which means "use the default". Defaults: **`DEFAULT_BACKFILL_SESSIONS = 50`** conversations, **`DEFAULT_BACKFILL_BYTES = 209715200` (200 MiB)** bytes. Accepted ranges: **1..500** conversations, **1 MiB..2 GiB** bytes.
+Both fields may be `null` or absent, which means "use the default". The default is **size only**: `DEFAULT_BACKFILL_BYTES` = **209715200 bytes (200 MiB)**, and `DEFAULT_BACKFILL_SESSIONS` = **null (no count limit)**. Bytes must be **1 MiB..2 GiB**; if a caller passes `maxSessions` explicitly it must be an integer **1..500** (`null` still means unlimited).
 
-The page's "One-click upload" always sends `{"maxSessions": null, "maxBytes": null}` — the two inputs are gone from the UI (the defaults are adequate and the inputs were noise), so a click always uses the Host default. The parameters and their validation stay in the **API**, available to scripts or to whatever needs them later.
+So **the count is no longer a gate**: a run keeps selecting until the 200 MiB budget is spent, taking as many conversations as fit. The page's "One-click upload" always sends `{"maxSessions": null, "maxBytes": null}` — the toolbar line reads `up to 200 MB per run` and no input exposes the allowance; the parameters and their validation stay in the **API**, so a script that wants a count limit can still pass `maxSessions`.
 
 | Outcome | Answer |
 |---|---|
@@ -229,9 +229,9 @@ The page's "One-click upload" always sends `{"maxSessions": null, "maxBytes": nu
 | POST without `content-type: application/json` | `415` + `{"error": "content-type must be application/json"}` |
 | Method other than GET/POST | `405` + `allow: GET, POST` |
 
-**What it picks**: every stored conversation where `stateOf(...) !== "uploaded"` and `!isEmptyOf(...)` — a `partial` session owes its tail, so it counts — newest write first, stopping at whichever of the two caps is reached first. Whatever is left out is counted in `skipped`.
+**What it picks**: every stored conversation where `stateOf(...) !== "uploaded"` and `!isEmptyOf(...)` — a `partial` session owes its tail, so it counts — newest write first, truncated **by bytes only**: the run stops when the next conversation no longer fits, and everything left out is counted in `skipped`.
 
-One deliberate conservative choice: if the **first** candidate alone exceeds `maxBytes`, the run selects **zero** sessions rather than squeezing one in — a blown-up single request is not worth one conversation. The page says "cap too small" for that case.
+One oversized log cannot stall the run: a conversation that alone exceeds `maxBytes` is **skipped (and counted in `skipped`) while the loop continues**, so smaller conversations behind it still go. The page therefore only says "cap too small" in the one remaining case — every candidate exceeds the budget on its own (`sessions: 0` with `skipped > 0`).
 
 **Execution is serial**: per conversation `uploader.discard → queued.delete → captureAny → uploader.drain → watermark.flush`. `discard` has to run before `captureAny`: dropping the queued copies first turns the re-read into a re-send instead of a second copy of the same records. The loop yields to the event loop between conversations, and a conversation that cannot be read is counted in `failed` while the rest of the run continues.
 
@@ -242,12 +242,12 @@ The report carries the run as a new top-level field `backfill` (key order: after
   "running": false, "startedAt": null, "finishedAt": null,
   "sessions": 0, "bytes": 0, "completed": 0, "failed": 0,
   "skipped": 0, "sentRecords": 0, "lastError": null,
-  "limits": { "maxSessions": 50, "maxBytes": 209715200 },
-  "defaults": { "maxSessions": 50, "maxBytes": 209715200 }
+  "limits": { "maxSessions": null, "maxBytes": 209715200 },
+  "defaults": { "maxSessions": null, "maxBytes": 209715200 }
 }
 ```
 
-`limits` is what **this run** used; `defaults` is the allowance the Host publishes, which the toolbar line renders — so a run started with custom limits does not change the small print. Before the first run: `running: false`, every counter 0, both at the defaults.
+`limits` is what **this run** used; `defaults` is the allowance the Host publishes, which the toolbar line renders — so a run started with custom limits does not change the small print. `maxSessions: null` in either place means **no count limit**; only `maxBytes` bounds the run. Before the first run: `running: false`, every counter 0, both at the defaults.
 
 > To drive it without the UI: `curl -X POST http://127.0.0.1:<webserver port>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'` (the `-H` is required, otherwise `415`), and the answer is the snapshot the run started with.
 
@@ -298,7 +298,7 @@ The delivery guarantee in one sentence: **the watermark only ever trails reality
 /uploadlog <session-id>   # re-send a specific session, stored ones included
 ```
 
-The command gives you three exits: catch up without waiting for the next turn after a collector outage, repair a segment the queue refused, and **backfill sessions that predate the installation** (see the honest note below). It re-reads from the watermark rather than from the in-memory "already queued" marker, which is exactly what recovers a tail that was counted as queued but never sent. To do this in bulk instead of one id at a time, use the status page's [one-click backfill](#one-click-backfill-batch) — it selects the same "unconfirmed and non-empty" sessions, with the two caps applied and the run serialised.
+The command gives you three exits: catch up without waiting for the next turn after a collector outage, repair a segment the queue refused, and **backfill sessions that predate the installation** (see the honest note below). It re-reads from the watermark rather than from the in-memory "already queued" marker, which is exactly what recovers a tail that was counted as queued but never sent. To do this in bulk instead of one id at a time, use the status page's [one-click backfill](#one-click-backfill-batch) — it selects the same "unconfirmed and non-empty" sessions, with the 200 MiB byte budget applied and the run serialised.
 
 On success it answers like this:
 
@@ -451,7 +451,7 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - The price is bandwidth: a full report is roughly 258–317 KB (856 rows including the 5 s cache snapshot) over loopback only — no traffic leaves the machine. Only beyond 5000 sessions does `truncated` / `moreSessions` matter again.
 - The status page needs the Host web server: a composition without `webServer` (headless, ACP) keeps uploading, but the route is absent and the page reports a read failure.
 - Meaningful for the web profile only (`dsh.client.platform: web`); headless and ACP profiles have no settings UI and keep only the Host-side upload.
-- **Backfill scale** (all of these are one snapshot from the moment these docs were written; they move with new sessions and backfills): on the development machine about **613** of 856 sessions were eligible at first (non-empty, unconfirmed); the default caps (50 sessions / 200 MiB) cover 50 sessions in one run, about 54 MiB, and `skipped` stood at 611 then. Backfilled sessions leave the candidate set — after a few runs "not uploaded" is down to **170**, the number the card shows — so each click takes the 50 most owed at that moment. The **session cap is the bottleneck**: the 200 MiB byte cap needs roughly 380 median-sized (562 KiB) sessions to fill, and since the page does not expose the caps, sending more means clicking again.
+- **Backfill scale** (all of these are one snapshot from the moment these docs were written; they move with new sessions and backfills): on the development machine about **613** of 856 sessions were eligible at first (non-empty, unconfirmed). The default is now **size only** (200 MiB), so a run keeps taking conversations until the budget is spent; at a median log size of 562 KiB, **200 MiB is roughly 380 conversations**, which on this machine means one run swallows the backlog — the count cap (a default of 50) is no longer the bottleneck. Backfilled sessions leave the candidate set: after a few runs "not uploaded" is down to **170** (the number the card shows), about 93 MiB by the same median estimate, so a single run easily covers it. A run that hits real bulk stops at 200 MiB and reports the rest as `skipped`; click again.
 - Backfill progress moves in 5–10 second steps (5 s report cache plus stale-while-revalidate), and one run only covers the sessions it selected; the rest wait for the next click.
 
 ## License

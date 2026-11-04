@@ -28,9 +28,10 @@ All notable changes to this project are documented here. The format follows
 - One-click backfill: `POST /plugin/session-log-universal/backfill` (the write
   half of the same handler, same loopback guard) starts one serial run over the
   sessions the collector has not fully confirmed, with dual caps
-  (`DEFAULT_BACKFILL_SESSIONS` = 50 conversations, `DEFAULT_BACKFILL_BYTES` =
-  200 MiB, accepted ranges 1..500 and 1 MiB..2 GiB). If the first candidate alone
-  exceeds the byte cap the run selects zero sessions instead of overshooting.
+  (`DEFAULT_BACKFILL_BYTES` = 200 MiB, `DEFAULT_BACKFILL_SESSIONS` = `null`,
+  accepted ranges 1 MiB..2 GiB and — for an explicit count — 1..500). A
+  conversation that alone exceeds the byte budget is skipped and counted, so one
+  oversized log cannot turn a run into nothing.
   The caps are validated at the API boundary only: the page always sends
   `{"maxSessions": null, "maxBytes": null}` and shows the published allowance
   (`backfill.defaults`) as small print. The run is published in the report as
@@ -82,6 +83,12 @@ All notable changes to this project are documented here. The format follows
   deliver.
 - A selected filter card paints with the business accent (border, tinted fill,
   1 px inset ring, brighter label) instead of looking like an unselected one.
+- Backfill limits are **size-only by default**: `DEFAULT_BACKFILL_SESSIONS` is
+  now `null` (no count limit) while `DEFAULT_BACKFILL_BYTES` stays 200 MiB, so a
+  run keeps taking conversations until the byte budget is spent. `maxSessions`
+  is still honoured when a caller passes it explicitly in the POST body
+  (integer 1..500), and the report publishes `null` in `limits` / `defaults`
+  when no count limit applies.
 - Shipped as a profile bundle: `package.json` declares `dsh.bundle.patch`
   (`./cordis.patch.yml`, one loader row), so the plugin can be installed by
   listing it in `dsh.profile.bundles` — which is also what makes the Plugins
