@@ -24,6 +24,21 @@ All notable changes to this project are documented here. The format follows
 - Titles and activity for the report: read from `session/title` (falling back to
   the opening human prompt) and from the stored session logs, both cached and
   budgeted.
+- One-click backfill: `POST /plugin/session-log-universal/backfill` (the write
+  half of the same handler, same loopback guard) starts one serial run over the
+  sessions the collector has not fully confirmed, with dual caps
+  (`DEFAULT_BACKFILL_SESSIONS` = 50 conversations, `DEFAULT_BACKFILL_BYTES` =
+  200 MiB, accepted ranges 1..500 and 1 MiB..2 GiB). If the first candidate alone
+  exceeds the byte cap the run selects zero sessions instead of overshooting.
+  The caps are validated at the API boundary only: the page always sends
+  `{"maxSessions": null, "maxBytes": null}` and shows the published allowance
+  (`backfill.defaults`) as small print. The run is published in the report as
+  `backfill` (running, progress, skipped, sent records, last error, limits,
+  defaults).
+- Filterable totals in the status page: the five cards are always rendered (so
+  the row never reflows), and "Uploaded" / "Not uploaded" toggle a filter
+  ("Not uploaded" includes partial rows) that stacks with the search box, so the
+  visibility line counts exactly what is on screen.
 - `scripts/sync-dev.mjs`, so a checkout can be copied into the runtime copy the
   loader imports (`--dry-run`, `--check`, `--target`, idempotent).
 - Test suite under `tests/` (`npm test`): the report and its route are covered by
@@ -47,7 +62,9 @@ All notable changes to this project are documented here. The format follows
   `totals.ackedEvents` is the headline number.
 - Rebuilding is activity-gated: the report is reused for 5 s and rebuilt on that
   cadence only while the route was read within the last 30 s, so an unopened
-  plugin does no report work at all.
+  plugin does no report work at all. Because a request is answered with the
+  previous value while the next one builds, backfill progress is reported in
+  5–10 second steps.
 - Titles: 96 events scanned per log, 32 new titles per rebuild (96 on the first
   build), so a freshly opened page fills 500 rows in about a minute.
 - `package.json` is publishable (`private: false`, `files`, `exports`,

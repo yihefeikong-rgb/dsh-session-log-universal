@@ -101,7 +101,7 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
 
 这一页是本插件注册进内置插件设置页（`settings.plugins.tab` 这个根级 list slot）的独立标签页（id `upload-status`，order 20，排在只读的“插件列表”之后），不需要改任何官方包。
 
-页面顶部是统计卡——**会话总数 / 已上传 / 部分上传 / 未上传 / 已上传事件**（「部分上传」只在确实存在这种会话时才出现，所以通常是 4 张、需要时 5 张）——加数据生成时间、当前采集端地址和一个「刷新」按钮；下面是搜索框（按标题、会话 ID 或目录过滤）与逐会话的列表。
+页面顶部固定五张统计卡——**会话总数 / 已上传 / 部分上传 / 未上传 / 已上传事件**（部分上传为 0 时也显示，卡片数量不会跳动）；右侧是工具栏（「一键上传」「刷新」，外加一句当前默认额度的小字）与数据生成时间、当前采集端地址；下面是搜索框（按标题、会话 ID 或目录过滤）与逐会话的列表。
 
 「已上传事件」取的是 `totals.ackedEvents`（各会话**已确认条数**之和，历史会话按 `ackedSeq + 1` 计）。`totals.events` 只是**已知条数的下界**，历史会话条数未知所以经常是 0，界面不拿它当主指标。
 
@@ -114,6 +114,10 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
 - 徽标下方是上游证据：确认的 HTTP 状态码、距现在多久，以及收集端返回里的 `partialSuccess` 说明（被拒了几条记录、为什么），所以“没网”“401”“收集端说收了一部分”在页面上是能区分开的。
 
 列表上方一行是可见性统计：`可见 N 个会话（共 M 个）`；有空会话被隐藏时变成 `…，已隐藏 K 个空会话（没有任何事件）`。列表底部在截断时还有一行 `还有 N 个有内容的会话未展示（最多展示 500 个）`。
+
+- **统计卡可以当筛选器用**：点「已上传」或「未上传」把列表筛到该状态，再点同一个取消。「未上传」筛选包含“部分上传”的行——它同样没传完。筛选与搜索叠加，上方“可见 N 个会话”是筛选 + 搜索之后的真实行数，页面还会显示一行 `筛选中：未上传` 提示当前筛选。
+- **工具栏**：只有「一键上传」和「刷新」两个按钮，旁边一句小字说明当前额度——`每次最多 50 个会话 / 200 MB`，数值取自报告的 `backfill.defaults`。界面**不暴露**限额输入：点一次就走 Host 的默认额度（50 会话 / 200 MiB），想多传就多点几次。上传期间「一键上传」禁用并显示 `上传中 completed/sessions`；结束后显示 `已补传 N 个会话（发送 M 条记录）`，有失败再补一句 `，失败 N 个`，失败详情另有 `上次上传出错：…` 一行；没有可补传会话时提示 `没有需要补传的会话`；额度小到一个会话都装不下时提示 `限额太小：有 N 个会话超出了单次字节上限…`；撞上正在跑的一批则提示 `上一批还在上传中`。
+- **进度是慢节奏的**：报告有 5 秒缓存且是 stale-while-revalidate（本次请求先返回上一份值、后台重建下一份），所以进度**最快约 5~10 秒跳一次**；「上传中」看起来停顿是正常的，不是卡死。
 
 **空会话**（一个事件都没有）默认不占列表：几百条空会话会把真正有信息的行埋掉。判据是 Host 算好的 `isEmpty`——`localEvents === 0`，或者条数未知时日志物理大小 `sizeBytes <= 4096`（`EMPTY_LOG_BYTES`，实测 header-only 日志最大 2231 字节、最小“真有事件”的日志 8192 字节，4096 落在安全区间中部）。空会话仍然计入合计。
 
@@ -133,15 +137,16 @@ session-log-universal: uploading every session log to https://dsh-otel-collector
 
 ### 数据从哪来
 
-这一页的数据来自 Host 注册的一个**只读路由**：
+这一页的数据来自 Host 注册的一个路由；同一个 handler 既提供**只读的报告**、也提供**写的一键补传**（见下一小节）：
 
 ```text
-GET /plugin/session-log-universal/report
+GET  /plugin/session-log-universal/report
+POST /plugin/session-log-universal/backfill
 ```
 
 | 项 | 行为 |
 |---|---|
-| 方法 | 只接受 GET；其它方法返回 `405`（带 `allow: GET`） |
+| 方法 | 同一个 handler 按 method 分派：GET 返回报告、POST 启动一键补传（见下）；其它方法返回 `405`（带 `allow: GET, POST`） |
 | 访问范围 | 只服务回环地址（`127.0.0.1` / `localhost` / `::1` 及其端口写法）；其它 `host` 返回 `403` —— 响应里带会话标题和目录，不该出本机 |
 | 缓存 | 响应头 `cache-control: no-store`；同一份报告在 5 秒内被复用。**只有在过去 30 秒内被读过**才会按 5 秒节奏重建，没有任何客户端在看就完全不构建（定时器空转，不花 CPU） |
 | 行数 | 最多 500 行，**有内容的会话优先**；超出时 `truncated: true` 并给出 `moreSessions`（被挡在 500 行之外、但确实有内容的会话数）。合计仍按**全部**会话统计 |
@@ -151,6 +156,58 @@ GET /plugin/session-log-universal/report
 
 - 浏览器直接打开 `http://127.0.0.1:<webserver 端口>/plugin/session-log-universal/report`，就是原始的 JSON；
 - 桌面应用里页面本身是自定义 scheme，所以客户端不用 `fetch` 的相对路径，而是经 shell 提供的 `__DSH_TRANSPORT__.fetch` 取同一路径的**文档相对形式**（`plugin/session-log-universal/report`，没有前导斜杠）——同一个路由，两种到达方式。
+
+### 一键补传（批量）
+
+「一键上传」调的是同一个处理器的另一半：
+
+```text
+POST /plugin/session-log-universal/backfill
+```
+
+这是**写操作**，启动一次“批量补传未上传的会话”。同一个 handler 按 method 分派：GET 返回报告、POST 启动补传，所以 `GET /backfill` 也返回报告、`POST /report` 同样能启动补传——同一个命名空间里的同一能力，不是为了多开权限面。
+
+请求体是可空 JSON（`content-type` 不强制，但非空 body 必须能解析）：
+
+```json
+{ "maxSessions": 50, "maxBytes": 209715200 }
+```
+
+两个字段都可以 `null` 或省略，表示用默认值。默认限额：**`DEFAULT_BACKFILL_SESSIONS = 50`** 个会话、**`DEFAULT_BACKFILL_BYTES = 209715200`（200 MiB）** 字节；合法区间是会话数 **1..500**、字节 **1 MiB..2 GiB**。
+
+界面上的「一键上传」固定发 `{"maxSessions": null, "maxBytes": null}`——页面不再暴露这两个输入框（默认额度已经够用，输入框只是噪音），所以点一次永远走 Host 默认值。限额参数与校验**保留在 API 层**，脚本或将来需要时照旧可用。
+
+| 结果 | 响应 |
+|---|---|
+| 启动成功 | `200` + 报告快照 + `started: true` |
+| 没有可补传的会话 | `200` + `started: false`、`sessions: 0` |
+| 已经有一批在跑 | `409` + 同一份快照 |
+| 限额越界 / 非整数 / 坏 JSON / body > 4096 字节 | `400` + `{"error": "..."}` |
+| 上传开关已关闭 | `400` |
+| 非回环地址 | `403` |
+| 非 GET/POST | `405` + `allow: GET, POST` |
+
+**选目标的规则**：所有已存会话里 `stateOf(...) !== "uploaded"` 且 `!isEmptyOf(...)` 的那些（`partial` 的尾巴也算在内，反正它没传完），按 `updatedAt` 倒序，两个限额**任一先到即停**，没选中的差额计入 `skipped`。
+
+这里有一个刻意的保守取舍：如果**第一个**候选单独就超过 `maxBytes`，这一轮会选中 **0 个**而不是硬塞一个——不值得为了一行记录冒单次请求爆掉的风险。界面据此提示“限额太小”。
+
+**执行是串行的**，每个会话依次 `uploader.discard → queued.delete → captureAny → uploader.drain → watermark.flush`。`discard` 必须在 `captureAny` 之前，这是“不重复上传”的保证：先把队列里该会话的副本丢掉，再从水位线重读，于是重读是“补发”而不是“第二份”。会话之间让出事件循环，单个会话失败计入 `failed` 并继续跑剩下的。
+
+报告里新增一个顶层字段 `backfill`（键序在 `moreSessions` 之后、`totals` 之前）：
+
+```json
+"backfill": {
+  "running": false, "startedAt": null, "finishedAt": null,
+  "sessions": 0, "bytes": 0, "completed": 0, "failed": 0,
+  "skipped": 0, "sentRecords": 0, "lastError": null,
+  "limits": { "maxSessions": 50, "maxBytes": 209715200 },
+  "defaults": { "maxSessions": 50, "maxBytes": 209715200 }
+}
+```
+
+`limits` 是**这次运行实际用的**额度，`defaults` 是 Host 发布的**默认额度**（界面用它显示工具栏那句小字，所以即使某次运行带了自定义 `limits`，小字也不会跟着变）。没跑过时 `running: false`、计数全 0、两者都是默认值。
+
+> 想自己跑一次而不点界面：`curl -X POST http://127.0.0.1:<webserver 端口>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'`，响应就是补传开始时的快照。
 
 开关关掉时页面顶部会显示一条“上传开关已关闭，新事件不会再上传”的提示。
 
@@ -200,6 +257,8 @@ GET /plugin/session-log-universal/report
 ```
 
 这个命令给你三个出口：收集端恢复后不用等下一轮就补发；队列溢出丢过一段时手工补齐；以及**给装了插件之前的旧会话补传**（见下面的诚实声明）。它按水位线重读，不是按内存里“已排队”的标记，所以能把已经算过排队、实际没发出去的那段救回来。
+
+要批量补而不是一个个敲会话 id 时，用[状态页](#上传状态页)的「一键上传」——它挑的就是同一批“未确认且非空”的会话，只是带上双限额、串行跑完。
 
 成功时返回形如：
 
@@ -332,10 +391,11 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 | 资源属性 | `service.name = deepseek-harness`、`service.version` = harness 版本、`user.id` = `<DSH_HOME>/.anonymous-user-id` 里的匿名 uuid（与官方 helper 共用同一个） |
 | 成功判定 | HTTP 2xx |
 | 状态页数据 | `GET /plugin/session-log-universal/report`（Host 本地只读路由，仅回环地址，`no-store`） |
+| 一键补传 | `POST /plugin/session-log-universal/backfill`（同一 handler 的写半边，同一回环守卫；body 上限 4096 字节） |
 
 ## 已知限制
 
-- **不会补传安装之前的历史会话。** 只有插件加载之后发生的事件会被捕获；`includeHistory` 说的“从 seq 0 开始”只针对插件挂载时**仍在内存里**的活动会话。磁盘上那些旧会话要用 `/uploadlog <session-id>` 手工补，或者干脆不补。
+- **安装时不会自动补传历史会话。** 只有插件加载之后发生的事件会被捕获；`includeHistory` 说的“从 seq 0 开始”只针对插件挂载时**仍在内存里**的活动会话。磁盘上那些旧会话不用一个个敲 `/uploadlog`——状态页的「一键上传」会挑出所有“未确认且非空”的已存会话批量补传；不想传就留着不点。
 - **数据会离开本机。** 见开头那段：内容发往 DeepSeek 官方收集端，匿名 `user.id` 不是账号身份，但会话内容就是会话内容。
 - 队列上限（默认 4096 条）在长时间断网后又一次性恢复时可能被顶满，表现为状态页有灰点、水位线落后；等收集端可达或者手动 `/uploadlog` 即可追平，不会静默丢数据。
 - 单条事件超过 `maxRequestBytes`（默认 4 MB）时无法分片，只能跳过并在日志里告警。
@@ -344,6 +404,8 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - 状态页最多列 500 个会话，且优先列有内容的会话（合计仍按全部会话统计）；被挡住的会话数由 `moreSessions` 给出，页面底部显示「还有 N 个有内容的会话未展示」。
 - 状态页依赖 Host 的 web 服务器：没有 `webServer` 的组合（headless/ACP）上传照旧，但那条只读路由不存在，页面会显示读取失败。
 - 只对 web profile 有意义（`dsh.client.platform: web`）；headless/ACP 等没有设置界面，只剩 Host 侧上传。
+- **一键补传的规模**：这台机器 856 个会话里可补传（非空且未确认）约 613 个；默认限额（50 会话 / 200 MiB）一次覆盖 50 个、约 54 MiB、`skipped` 611。也就是说这里**会话数是瓶颈**——200 MiB 的字节上限要大约 380 个中位大小（562 KiB）的会话才吃满；界面不给改额度，想多传就多点几次「一键上传」（每次都会挑当时最欠的 50 个）。
+- 补传进度是慢节奏的（报告 5 秒缓存 + stale-while-revalidate，最快 5~10 秒一跳），而且一次运行只覆盖当次选中的会话，剩下的下次再点。
 
 ## 许可
 

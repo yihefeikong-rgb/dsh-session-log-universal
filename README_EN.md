@@ -101,7 +101,7 @@ When the write is refused or fails in transport, the UI keeps showing the accept
 
 The page is the plugin's own tab inside the built-in plugins settings section (registered into the root list slot `settings.plugins.tab`, id `upload-status`, order 20, after the read-only plugin inventory). No official package is touched.
 
-The top of the page holds the totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial appears only while such a session exists, so usually four cards, five when it matters) — plus the instant the data was generated, the current collector endpoint and a **Refresh** button. Below them: a search box (title, session id or directory) and one row per session.
+The top of the page always holds five totals — **Sessions / Uploaded / Partial / Not uploaded / Uploaded events** (Partial shows 0 rather than disappearing, so the row never changes width) — with the toolbar (one-click upload, refresh, and a small line naming the current cap), the instant the data was generated and the collector endpoint. Below them: a search box (title, session id or directory) and one row per session.
 
 "Uploaded events" is `totals.ackedEvents`: the sum of the **acknowledged event counts** (a session with an unknown length contributes `ackedSeq + 1`). `totals.events` is only a **lower bound on the known counts** — historical sessions have no count, so it is often 0 — and the page does not use it as its headline number.
 
@@ -114,6 +114,10 @@ Each row shows:
 - under the badge sits the upstream evidence: the HTTP status of that acknowledgement, how long ago it happened, and any `partialSuccess` note from the collector (how many records it rejected and why) — so "offline", "401" and "the collector accepted only part of it" do not all look the same.
 
 Above the list one line reports visibility: `{visible} of {sessions} conversations shown`; with empty conversations hidden it becomes `…; {hidden} empty conversations hidden (no events)`. At the bottom, a truncated report adds `{count} conversations with content are not shown (at most 500 are listed)`.
+
+- **The totals double as filters**: clicking "Uploaded" or "Not uploaded" narrows the list to that state, and clicking the same card again clears it. "Not uploaded" includes the partial rows — they are not finished either. The filter stacks with the search box, so the "N of M shown" line above counts what is really on screen, and a `Filtered: {name}` line says which filter is active.
+- **Toolbar**: only **One-click upload** and **Refresh**, plus one small line naming the current allowance — `up to 50 conversations / 200 MB per run`, taken from the report's `backfill.defaults`. The page does **not** expose the caps: a click always uses the Host defaults (50 conversations / 200 MiB), so sending more means clicking again. While a run is going the upload button is disabled and reads `uploading completed/sessions`; when it finishes the page says `backfilled N conversation(s) (M record(s) sent)`, adds `N failed` when some did, and keeps a separate `last upload error: …` line for the detail. Nothing to send reads `no conversations need backfilling`; an allowance too small to fit even one conversation reads `cap too small: N conversation(s) exceed the per-run byte limit`; a run already in progress reads `the previous batch is still uploading`.
+- **Progress is slow on purpose**: the report is cached for 5 seconds and is stale-while-revalidate (this request answers with the previous value while the next one is built in the background), so progress moves in **roughly 5–10 second steps**. A stalled-looking counter is normal, not a hang.
 
 **Empty conversations** (not a single event) do not take a row by default: hundreds of empty rows would bury the ones that can say something. The Host decides with `isEmpty` — `localEvents === 0`, or, when the count is unknown, a physical log size `sizeBytes <= 4096` (`EMPTY_LOG_BYTES`; measured header-only logs run up to 2231 bytes and the smallest log holding an event is 8192 bytes, so 4096 sits in the middle of the safe gap). Empty conversations still count in the totals.
 
@@ -133,15 +137,16 @@ The badge is derived from **locally recorded upstream evidence**, never from "we
 
 ### Where the data comes from
 
-The page is fed by one **read-only route** registered by the Host:
+The page is fed by routes registered by the Host — one handler serves both the **read-only report** and the **write-side backfill** (next section):
 
 ```text
-GET /plugin/session-log-universal/report
+GET  /plugin/session-log-universal/report
+POST /plugin/session-log-universal/backfill
 ```
 
 | Property | Behaviour |
 |---|---|
-| Methods | GET only; anything else answers `405` with `allow: GET` |
+| Methods | one handler dispatches by method: GET answers the report, POST starts a one-click backfill (below); anything else answers `405` with `allow: GET, POST` |
 | Access | loopback only (`127.0.0.1`, `localhost`, `::1` and their port forms); a foreign `host` answers `403` — the payload carries session titles and directories and does not belong off this machine |
 | Caching | `cache-control: no-store`; the same report is reused for 5 seconds. Rebuilding on the 5 s cadence happens **only while the route was read within the last 30 seconds**; with no client watching, nothing is built at all (the timer idles without doing work) |
 | Rows | at most 500, **sessions with content first**; beyond that `truncated: true` plus `moreSessions` (how many sessions that do hold content were left out of the 500). Totals still count **every** session |
@@ -151,6 +156,58 @@ Two ways to audit it:
 
 - open `http://127.0.0.1:<webserver port>/plugin/session-log-universal/report` in a browser for the raw JSON;
 - inside the desktop application the page itself is served from a custom scheme, so the client does not call `fetch` with a rooted path: it goes through the shell-provided `__DSH_TRANSPORT__.fetch` with the **document-relative** form of the same path (`plugin/session-log-universal/report`, no leading slash). One route, two ways to reach it.
+
+### One-click backfill (batch)
+
+The "One-click upload" button talks to the other half of the same handler:
+
+```text
+POST /plugin/session-log-universal/backfill
+```
+
+This is a **write**: it starts one run that backfills the conversations the collector has not fully confirmed. The handler dispatches by method — GET answers the report, POST starts a backfill — so `GET /backfill` also returns the report and `POST /report` also starts a run. One capability in one namespace, not a widened permission surface.
+
+The body is optional JSON (the content type is not enforced, but a non-empty body must parse):
+
+```json
+{ "maxSessions": 50, "maxBytes": 209715200 }
+```
+
+Both fields may be `null` or absent, which means "use the default". Defaults: **`DEFAULT_BACKFILL_SESSIONS = 50`** conversations, **`DEFAULT_BACKFILL_BYTES = 209715200` (200 MiB)** bytes. Accepted ranges: **1..500** conversations, **1 MiB..2 GiB** bytes.
+
+The page's "One-click upload" always sends `{"maxSessions": null, "maxBytes": null}` — the two inputs are gone from the UI (the defaults are adequate and the inputs were noise), so a click always uses the Host default. The parameters and their validation stay in the **API**, available to scripts or to whatever needs them later.
+
+| Outcome | Answer |
+|---|---|
+| Started | `200` + the report snapshot + `started: true` |
+| Nothing to backfill | `200` + `started: false`, `sessions: 0` |
+| A run is already going | `409` + the same snapshot |
+| Out-of-range or non-integer limit, bad JSON, body > 4096 bytes | `400` + `{"error": "..."}` |
+| Uploading switched off | `400` |
+| Not a loopback request | `403` |
+| Method other than GET/POST | `405` + `allow: GET, POST` |
+
+**What it picks**: every stored conversation where `stateOf(...) !== "uploaded"` and `!isEmptyOf(...)` — a `partial` session owes its tail, so it counts — newest write first, stopping at whichever of the two caps is reached first. Whatever is left out is counted in `skipped`.
+
+One deliberate conservative choice: if the **first** candidate alone exceeds `maxBytes`, the run selects **zero** sessions rather than squeezing one in — a blown-up single request is not worth one conversation. The page says "cap too small" for that case.
+
+**Execution is serial**: per conversation `uploader.discard → queued.delete → captureAny → uploader.drain → watermark.flush`. `discard` has to run before `captureAny`: dropping the queued copies first turns the re-read into a re-send instead of a second copy of the same records. The loop yields to the event loop between conversations, and a conversation that cannot be read is counted in `failed` while the rest of the run continues.
+
+The report carries the run as a new top-level field `backfill` (key order: after `moreSessions`, before `totals`):
+
+```json
+"backfill": {
+  "running": false, "startedAt": null, "finishedAt": null,
+  "sessions": 0, "bytes": 0, "completed": 0, "failed": 0,
+  "skipped": 0, "sentRecords": 0, "lastError": null,
+  "limits": { "maxSessions": 50, "maxBytes": 209715200 },
+  "defaults": { "maxSessions": 50, "maxBytes": 209715200 }
+}
+```
+
+`limits` is what **this run** used; `defaults` is the allowance the Host publishes, which the toolbar line renders — so a run started with custom limits does not change the small print. Before the first run: `running: false`, every counter 0, both at the defaults.
+
+> To drive it without the UI: `curl -X POST http://127.0.0.1:<webserver port>/plugin/session-log-universal/backfill -H 'content-type: application/json' -d '{"maxSessions":2}'`, and the answer is the snapshot the run started with.
 
 With the switch off, the page shows a banner saying uploading is switched off.
 
@@ -199,7 +256,7 @@ The delivery guarantee in one sentence: **the watermark only ever trails reality
 /uploadlog <session-id>   # re-send a specific session, stored ones included
 ```
 
-The command gives you three exits: catch up without waiting for the next turn after a collector outage, repair a segment the queue refused, and **backfill sessions that predate the installation** (see the honest note below). It re-reads from the watermark rather than from the in-memory "already queued" marker, which is exactly what recovers a tail that was counted as queued but never sent.
+The command gives you three exits: catch up without waiting for the next turn after a collector outage, repair a segment the queue refused, and **backfill sessions that predate the installation** (see the honest note below). It re-reads from the watermark rather than from the in-memory "already queued" marker, which is exactly what recovers a tail that was counted as queued but never sent. To do this in bulk instead of one id at a time, use the status page's [one-click backfill](#one-click-backfill-batch) — it selects the same "unconfirmed and non-empty" sessions, with the two caps applied and the run serialised.
 
 On success it answers like this:
 
@@ -332,10 +389,11 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 | Resource attributes | `service.name = deepseek-harness`, `service.version` = harness version, `user.id` = the anonymous uuid in `<DSH_HOME>/.anonymous-user-id` (shared with the official helper) |
 | Success | HTTP 2xx |
 | Status page data | `GET /plugin/session-log-universal/report` (local Host route, loopback only, `no-store`) |
+| One-click backfill | `POST /plugin/session-log-universal/backfill` (the write half of the same handler, same loopback guard, 4096-byte body cap) |
 
 ## Known limits
 
-- **Sessions from before the installation are not backfilled.** Only events after the plugin loads are captured; `includeHistory` means "start at seq 0" for sessions that are **still live in memory** at mount time, nothing more. Old sessions on disk need `/uploadlog <session-id>`, or stay unuploaded.
+- **Sessions from before the installation are not backfilled automatically.** Only events after the plugin loads are captured; `includeHistory` means "start at seq 0" for sessions that are **still live in memory** at mount time, nothing more. Old sessions on disk do not need a `/uploadlog <session-id>` each — "One-click upload" selects every unconfirmed non-empty stored session and backfills them; leave it alone if you do not want that.
 - **Data leaves the machine.** See the note at the top: content goes to DeepSeek's official collector. The anonymous `user.id` is not an account identity, but session content is session content.
 - The queue bound (4096 records by default) can be reached after a long offline stretch and a sudden recovery; the status page then shows gray dots and the watermark trails until the collector is reachable again or `/uploadlog` runs. Records are not silently dropped.
 - A single event larger than `maxRequestBytes` (4 MB by default) cannot be split; it is skipped with a warning.
@@ -344,6 +402,8 @@ DSH_SLU_HOST_MODULE="%USERPROFILE%\.dsh\node_modules\dsh-session-log-universal\l
 - The status page lists at most 500 sessions and prefers sessions that hold content (totals still count every session); the number left out is published as `moreSessions` and shown at the bottom of the list.
 - The status page needs the Host web server: a composition without `webServer` (headless, ACP) keeps uploading, but the route is absent and the page reports a read failure.
 - Meaningful for the web profile only (`dsh.client.platform: web`); headless and ACP profiles have no settings UI and keep only the Host-side upload.
+- **Backfill scale**: on the development machine, 613 of 856 sessions are eligible (non-empty, unconfirmed); the default caps (50 sessions / 200 MiB) cover 50 sessions in one run, about 54 MiB, with `skipped` at 611. The **session cap is the bottleneck** there — the 200 MiB byte cap needs roughly 380 median-sized (562 KiB) sessions to fill, and since the page does not expose the caps, sending more means clicking again (each click takes the 50 most owed conversations at that moment).
+- Backfill progress moves in 5–10 second steps (5 s report cache plus stale-while-revalidate), and one run only covers the sessions it selected; the rest wait for the next click.
 
 ## License
 

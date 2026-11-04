@@ -8,6 +8,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  BACKFILL_ROUTE,
+  DEFAULT_BACKFILL_BYTES,
+  DEFAULT_BACKFILL_SESSIONS,
   EMPTY_LOG_BYTES,
   REPORT_MAX_ROWS,
   REPORT_ROUTE,
@@ -18,7 +21,12 @@ import {
   emptyReport,
   isEmptyOf,
   reportHandler,
+  SessionBackfill,
   SessionReport,
+  defaultBackfillLimits,
+  emptyBackfill,
+  parseBackfillLimits,
+  selectBackfillTargets,
   stateOf,
   titleFromEvents,
   upstreamOf,
@@ -308,6 +316,321 @@ test("SessionReport: a source that throws degrades the row instead of the build"
   await report.stop();
 });
 
+/** A POST request stub with an optional body, as the handler reads it. */
+function postRequest(body, host = "127.0.0.1:26117") {
+  const text = body === undefined ? "" : typeof body === "string" ? body : JSON.stringify(body);
+  const bytes = Buffer.from(text, "utf8");
+  return {
+    method: "POST",
+    headers: { host, "content-type": "application/json" },
+    async *[Symbol.asyncIterator]() {
+      yield bytes;
+    },
+  };
+}
+
+/** One stored session row the way the report collects it. */
+function stored(id, sizeBytes, updatedAt, localEvents = null) {
+  return { sessionId: id, sizeBytes, updatedAt, localEvents, title: null, cwd: null, parentSession: null };
+}
+
+test("parseBackfillLimits: an absent or empty body means the published defaults", () => {
+  const defaults = { limits: { maxSessions: DEFAULT_BACKFILL_SESSIONS, maxBytes: DEFAULT_BACKFILL_BYTES } };
+  assert.deepEqual(parseBackfillLimits(undefined), defaults);
+  assert.deepEqual(parseBackfillLimits(""), defaults);
+  assert.deepEqual(parseBackfillLimits("   "), defaults);
+  assert.deepEqual(parseBackfillLimits("{}"), defaults);
+  assert.deepEqual(parseBackfillLimits(JSON.stringify({ maxSessions: null, maxBytes: null })), defaults);
+  assert.deepEqual(parseBackfillLimits(JSON.stringify({ maxSessions: 7 })), { limits: { maxSessions: 7, maxBytes: DEFAULT_BACKFILL_BYTES } });
+  assert.deepEqual(parseBackfillLimits(JSON.stringify({ maxSessions: 500, maxBytes: 1048576 })), { limits: { maxSessions: 500, maxBytes: 1048576 } });
+});
+
+test("parseBackfillLimits: out-of-range and malformed bodies are refused with a reason", () => {
+  assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: 0 })).error, /maxSessions/);
+  assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: 501 })).error, /maxSessions/);
+  assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: 2.5 })).error, /maxSessions/);
+  assert.match(parseBackfillLimits(JSON.stringify({ maxSessions: "10" })).error, /maxSessions/);
+  assert.match(parseBackfillLimits(JSON.stringify({ maxBytes: 1024 })).error, /maxBytes/);
+  assert.match(parseBackfillLimits(JSON.stringify({ maxBytes: 2147483649 })).error, /maxBytes/);
+  assert.match(parseBackfillLimits("{not json").error, /not valid JSON/);
+  assert.match(parseBackfillLimits("[1,2]").error, /JSON object/);
+});
+
+test("selectBackfillTargets: takes what is owed and leaves out what is done or empty", () => {
+  const now = 1762200000000;
+  const sessions = [
+    stored("uploaded", 9000, now),
+    stored("partial", 9000, now - 10),
+    stored("never", 9000, now - 20),
+    stored("empty", 200, now - 30, 0),
+    stored("header-only", 331, now - 40),
+  ];
+  const ledger = {
+    uploaded: { seq: 9, at: now },
+    // A prefix was acknowledged ten minutes before the log stopped changing.
+    partial: { seq: 3, at: now - 600000 },
+  };
+  const selection = selectBackfillTargets(sessions, ledger, { maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.deepEqual(selection.targets.map((target) => target.sessionId), ["partial", "never"]);
+  assert.equal(selection.bytes, 18000);
+  assert.equal(selection.skipped, 0);
+  assert.equal(selection.targets[0].state, "partial");
+  assert.equal(selection.targets[1].state, "never");
+});
+
+test("selectBackfillTargets: the session limit and the byte limit both apply", () => {
+  const now = 1762200000000;
+  // 5000-byte logs: above the header-only ceiling, so every one holds events.
+  const sessions = [stored("s1", 5000, now), stored("s2", 5000, now - 1), stored("s3", 5000, now - 2), stored("s4", 5000, now - 3)];
+  const bySessions = selectBackfillTargets(sessions, {}, { maxSessions: 2, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.deepEqual(bySessions.targets.map((target) => target.sessionId), ["s1", "s2"]);
+  assert.equal(bySessions.bytes, 10000);
+  assert.equal(bySessions.skipped, 2);
+
+  const byBytes = selectBackfillTargets(sessions, {}, { maxSessions: 10, maxBytes: 12000 });
+  assert.deepEqual(byBytes.targets.map((target) => target.sessionId), ["s1", "s2"]);
+  assert.equal(byBytes.bytes, 10000);
+  assert.equal(byBytes.skipped, 2);
+
+  // Whichever is reached first wins.
+  const both = selectBackfillTargets(sessions, {}, { maxSessions: 3, maxBytes: 10000 });
+  assert.deepEqual(both.targets.map((target) => target.sessionId), ["s1", "s2"]);
+  assert.equal(both.skipped, 2);
+
+  // A limit too small for the very first candidate uploads nothing rather than
+  // silently exceeding it.
+  const tooSmall = selectBackfillTargets(sessions, {}, { maxSessions: 10, maxBytes: 4999 });
+  assert.deepEqual(tooSmall.targets, []);
+  assert.equal(tooSmall.bytes, 0);
+  assert.equal(tooSmall.skipped, 4);
+});
+
+test("selectBackfillTargets: activity order is newest first", () => {
+  const sessions = [stored("old", 9000, 100), stored("new", 9000, 300), stored("mid", 9000, 200)];
+  const selection = selectBackfillTargets(sessions, {}, { maxSessions: 3, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.deepEqual(selection.targets.map((target) => target.sessionId), ["new", "mid", "old"]);
+});
+
+test("selectBackfillTargets: missing limits fall back to the defaults", () => {
+  const sessions = Array.from({ length: 60 }, (_, index) => stored("s" + index, 5000, 1000 - index));
+  const selection = selectBackfillTargets(sessions, {}, {});
+  assert.equal(selection.targets.length, DEFAULT_BACKFILL_SESSIONS);
+  assert.equal(selection.skipped, 10);
+});
+
+/** A runner over in-memory sources, with the per-session step recorded. */
+function runner(overrides = {}) {
+  const calls = [];
+  let sent = 0;
+  let clock = 1762200000000;
+  const backfill = new SessionBackfill({
+    logger: quiet,
+    now: () => clock,
+    isEnabled: () => true,
+    sessions: async () => [stored("owed", 9000, 100), stored("done", 9000, 200)],
+    ledger: () => ({ done: { seq: 9, at: 200 } }),
+    sentRecords: () => sent,
+    runSession: async (sessionId) => {
+      calls.push(sessionId);
+      sent += 5;
+    },
+    ...overrides,
+  });
+  return { backfill, calls, advance: (millis) => { clock += millis; } };
+}
+
+test("SessionBackfill: runs the owed sessions once and refuses a second run", async () => {
+  const { backfill, calls } = runner();
+  const outcome = await backfill.start({ maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.equal(outcome.status, 200);
+  assert.equal(outcome.started, true);
+  assert.equal(outcome.snapshot.running, true);
+  assert.equal(outcome.snapshot.sessions, 1, "only the owed session is selected");
+  assert.deepEqual(outcome.snapshot.limits, { maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+
+  const conflict = await backfill.start({ maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.started, false);
+  assert.equal(conflict.snapshot.running, true);
+
+  await backfill.active;
+  assert.deepEqual(calls, ["owed"]);
+  const finished = backfill.snapshot();
+  assert.equal(finished.running, false);
+  assert.equal(finished.completed, 1);
+  assert.equal(finished.failed, 0);
+  assert.equal(finished.sentRecords, 5);
+  assert.notEqual(finished.finishedAt, null);
+  // The run's own limits are reported, and they never leak into the defaults.
+  assert.deepEqual(finished.limits, { maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.deepEqual(finished.defaults, { maxSessions: DEFAULT_BACKFILL_SESSIONS, maxBytes: DEFAULT_BACKFILL_BYTES });
+});
+
+test("SessionBackfill: defaults stay constant while limits follow the last run", async () => {
+  const defaults = { maxSessions: DEFAULT_BACKFILL_SESSIONS, maxBytes: DEFAULT_BACKFILL_BYTES };
+  const empty = emptyBackfill();
+  assert.deepEqual(empty.defaults, defaults);
+  assert.deepEqual(empty.limits, defaults);
+  assert.deepEqual(defaultBackfillLimits(), defaults);
+
+  const { backfill } = runner();
+  const custom = { maxSessions: 2, maxBytes: 1048576 };
+  const outcome = await backfill.start(custom);
+  assert.deepEqual(outcome.snapshot.defaults, defaults, "a running snapshot keeps the defaults");
+  await backfill.active;
+  const finished = backfill.snapshot();
+  assert.deepEqual(finished.limits, custom, "limits report what this run actually used");
+  assert.deepEqual(finished.defaults, defaults, "defaults do not follow the last run");
+
+  // A second run with different limits still leaves the defaults alone.
+  const second = await backfill.start({ maxSessions: 1, maxBytes: 2097152000 });
+  assert.deepEqual(second.snapshot.limits, { maxSessions: 1, maxBytes: 2097152000 });
+  await backfill.active;
+  assert.deepEqual(backfill.snapshot().defaults, defaults);
+});
+
+test("SessionBackfill: one unreadable session is counted and the run continues", async () => {
+  const seen = [];
+  const { backfill } = runner({
+    sessions: async () => [stored("a", 9000, 300), stored("b", 9000, 200), stored("c", 9000, 100)],
+    runSession: async (sessionId) => {
+      seen.push(sessionId);
+      if (sessionId === "b") throw new Error("log is corrupt");
+    },
+  });
+  await backfill.start({ maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  await backfill.active;
+  assert.deepEqual(seen, ["a", "b", "c"]);
+  const state = backfill.snapshot();
+  assert.equal(state.completed, 3);
+  assert.equal(state.failed, 1);
+  assert.match(state.lastError, /log is corrupt/);
+});
+
+test("SessionBackfill: nothing owed answers zero sessions without starting", async () => {
+  const { backfill } = runner({ sessions: async () => [stored("done", 1000, 200)], ledger: () => ({ done: { seq: 9, at: 200 } }) });
+  const outcome = await backfill.start({ maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.equal(outcome.status, 200);
+  assert.equal(outcome.started, false);
+  assert.equal(outcome.snapshot.running, false);
+  assert.equal(outcome.snapshot.sessions, 0);
+});
+
+test("SessionBackfill: uploading switched off refuses to start", async () => {
+  const { backfill } = runner({ isEnabled: () => false });
+  const outcome = await backfill.start({ maxSessions: 10, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.equal(outcome.status, 400);
+  assert.match(outcome.error, /is off/);
+});
+
+/** A backfill runner stub the handler tests drive directly. */
+function stubBackfill(outcome) {
+  const limits = [];
+  return {
+    limits,
+    start: async (given) => {
+      limits.push(given);
+      return outcome;
+    },
+  };
+}
+
+test("reportHandler: POST starts a backfill and answers the snapshot", async () => {
+  const snapshot = { ...emptyBackfill(), running: true, sessions: 4, bytes: 4096, startedAt: 7, limits: { maxSessions: 4, maxBytes: 1048576 } };
+  const backfill = stubBackfill({ status: 200, started: true, snapshot });
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, backfill);
+  const response = fakeResponse();
+  await handler(postRequest({ maxSessions: 4, maxBytes: 1048576 }), response);
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.body.toString("utf8"));
+  assert.equal(body.started, true);
+  assert.equal(body.running, true);
+  assert.equal(body.sessions, 4);
+  assert.deepEqual(body.limits, { maxSessions: 4, maxBytes: 1048576 });
+  assert.deepEqual(body.defaults, { maxSessions: DEFAULT_BACKFILL_SESSIONS, maxBytes: DEFAULT_BACKFILL_BYTES });
+  assert.deepEqual(backfill.limits, [{ maxSessions: 4, maxBytes: 1048576 }]);
+  // No body at all means the defaults, not a refusal.
+  const bare = fakeResponse();
+  await handler(postRequest(undefined), bare);
+  assert.equal(bare.statusCode, 200);
+  assert.deepEqual(backfill.limits.at(-1), { maxSessions: DEFAULT_BACKFILL_SESSIONS, maxBytes: DEFAULT_BACKFILL_BYTES });
+});
+
+test("reportHandler: POST reports a run already in progress as a conflict", async () => {
+  const backfill = stubBackfill({ status: 409, started: false, snapshot: { ...emptyBackfill(), running: true, sessions: 3 } });
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, backfill);
+  const response = fakeResponse();
+  await handler(postRequest({}), response);
+  assert.equal(response.statusCode, 409);
+  const body = JSON.parse(response.body.toString("utf8"));
+  assert.equal(body.started, false);
+  assert.equal(body.running, true);
+  assert.equal(body.sessions, 3);
+});
+
+test("reportHandler: POST refuses a bad limit and an oversized body", async () => {
+  const backfill = stubBackfill({ status: 200, started: false, snapshot: emptyBackfill() });
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, backfill);
+  const tooMany = fakeResponse();
+  await handler(postRequest({ maxSessions: 900 }), tooMany);
+  assert.equal(tooMany.statusCode, 400);
+  assert.match(JSON.parse(tooMany.body.toString("utf8")).error, /maxSessions/);
+  assert.equal(backfill.limits.length, 0, "an invalid body never reaches the runner");
+
+  const notJson = fakeResponse();
+  await handler(postRequest("{nope"), notJson);
+  assert.equal(notJson.statusCode, 400);
+
+  const oversized = fakeResponse();
+  await handler(postRequest("x".repeat(5000)), oversized);
+  assert.equal(oversized.statusCode, 400);
+  assert.match(JSON.parse(oversized.body.toString("utf8")).error, /larger than 4096/);
+});
+
+test("reportHandler: POST is refused when uploading is off", async () => {
+  const backfill = stubBackfill({ status: 400, started: false, error: "session-log-universal is off" });
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, backfill);
+  const response = fakeResponse();
+  await handler(postRequest({}), response);
+  assert.equal(response.statusCode, 400);
+  assert.deepEqual(JSON.parse(response.body.toString("utf8")), { error: "session-log-universal is off" });
+});
+
+test("reportHandler: POST obeys the loopback guard and the method list", async () => {
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, stubBackfill({ status: 200, started: false, snapshot: emptyBackfill() }));
+  const foreign = fakeResponse();
+  await handler(postRequest({}, "evil.example.com"), foreign);
+  assert.equal(foreign.statusCode, 403);
+
+  const put = fakeResponse();
+  await handler({ method: "PUT", headers: { host: "127.0.0.1:26117" } }, put);
+  assert.equal(put.statusCode, 405);
+  assert.equal(put.headers.allow, "GET, POST");
+
+  // Without a runner the route stays read-only, and says so.
+  const readOnly = reportHandler({ report: async () => emptyReport() }, quiet);
+  const posted = fakeResponse();
+  await readOnly(postRequest({}), posted);
+  assert.equal(posted.statusCode, 405);
+  assert.equal(posted.headers.allow, "GET");
+});
+
+test("reportHandler: a POST that throws answers 500 with the diagnostic", async () => {
+  const backfill = { start: async () => { throw new Error("selection exploded"); } };
+  const handler = reportHandler({ report: async () => emptyReport() }, quiet, backfill);
+  const response = fakeResponse();
+  await handler(postRequest({}), response);
+  assert.equal(response.statusCode, 500);
+  assert.match(JSON.parse(response.body.toString("utf8")).error, /selection exploded/);
+});
+
+test("report value: the backfill state rides beside the rows", () => {
+  const snapshot = { ...emptyBackfill(), running: true, startedAt: 1, sessions: 3, bytes: 900, completed: 1, limits: { maxSessions: 3, maxBytes: 5000 } };
+  const value = buildReport({ now: 2, endpoint: "x", enabled: true, sessions: [], ledger: {}, backfill: snapshot });
+  assert.deepEqual(value.backfill, snapshot);
+  assert.deepEqual(emptyReport().backfill, emptyBackfill());
+  assert.equal(BACKFILL_ROUTE, "/plugin/session-log-universal/backfill");
+});
 /** Sessions and ledger shared by the report assembly tests. */
 function fixture() {
   return {

@@ -135,7 +135,7 @@ The note is extracted from the response body, read once and bounded to 2 KB: an 
 
 A manual re-send drops the queued copies of that session first, so the re-read cannot upload the same tail twice. A batch already in flight is not recalled: for a manual command, a rare duplicate beats a lost record.
 
-### 7. Upload report route
+### 7. The report and backfill routes
 
 `lib/report.js` owns everything the status page needs, and it is built off the capture path:
 
@@ -157,15 +157,15 @@ A manual re-send drops the queued copies of that session first, so the re-read c
 
   The grace window covers the uploader's flush delay plus the round trip, so an ordinary turn is not mistaken for an owed tail while a genuinely newer write still is. Totals count every session, so a truncated table still answers "how much of the corpus is uploaded".
 
-The route:
+The routes:
 
 | property | value |
 |---|---|
-| path | `GET /plugin/session-log-universal/report` (exact match, registered through `ctx.inject(["webServer"], ...)` on a child context) |
-| methods | GET only (405 otherwise) |
-| access | loopback `host` header only (403 otherwise) — the response carries session titles and working directories |
-| caching | `cache-control: no-store`, `content-length`; the value is reused for `REPORT_REFRESH_MILLIS` (5 s) and rebuilt only while the route was read within `REPORT_ACTIVE_MILLIS` (30 s). A refused build answers 500 with the diagnostic instead of an empty table |
-| absent web server | uploading keeps working, the route simply does not exist; a conflicting registration is a warning, not a failure |
+| paths | `REPORT_ROUTE` = `/plugin/session-log-universal/report` and `BACKFILL_ROUTE` = `/plugin/session-log-universal/backfill`, both an exact match, both registered with the *same* handler through `ctx.inject(["webServer"], ...)` on a child context |
+| methods | one handler dispatches by method: GET publishes the report, POST starts a backfill. Anything else answers `405` with `allow: GET, POST`. Because both paths share the handler, `GET /backfill` also publishes the report and `POST /report` also starts a run — one capability in one namespace, not a widened surface |
+| access | loopback `host` header only (403 otherwise) — the payload carries session titles and working directories, and POST is a write |
+| caching | `cache-control: no-store`, `content-length`; the value is reused for `REPORT_REFRESH_MILLIS` (5 s) and rebuilt only while the route was read within `REPORT_ACTIVE_MILLIS` (30 s); a request during that window gets the previous value while the next one builds (stale-while-revalidate, so progress moves in 5–10 s steps). A refused build answers 500 with the diagnostic instead of an empty table |
+| absent web server | uploading keeps working, the routes simply do not exist; a conflicting registration is a warning, not a failure |
 
 Report value:
 
@@ -177,6 +177,13 @@ Report value:
   "enabled": true,
   "truncated": true,
   "moreSessions": 137,
+  "backfill": {
+    "running": false, "startedAt": 1762195000000, "finishedAt": 1762195001800,
+    "sessions": 50, "bytes": 56623104, "completed": 50, "failed": 0,
+    "skipped": 562, "sentRecords": 858, "lastError": null,
+    "limits": { "maxSessions": 50, "maxBytes": 209715200 },
+    "defaults": { "maxSessions": 50, "maxBytes": 209715200 }
+  },
   "totals": { "sessions": 856, "uploaded": 690, "partial": 3, "never": 163, "events": 412, "ackedEvents": 5310 },
   "rows": [
     {
@@ -201,9 +208,55 @@ Report value:
 }
 ```
 
-The first row is a stored session: its length is unknown, so the state came from the timestamps. The second row is live in memory, so it carries a real count — and its receipt shows a `207` with the collector's `partialSuccess` note. `totals.events` (412) counts only the sessions whose length is known, which is why the page headlines `ackedEvents` instead.
+The first row is a stored session: its length is unknown, so the state came from the timestamps. The second row is live in memory, so it carries a real count — and its receipt shows a `207` with the collector's `partialSuccess` note. `totals.events` (412) counts only the sessions whose length is known, which is why the page headlines `ackedEvents` instead. `backfill` sits between `moreSessions` and `totals` and describes the last run (or the empty run a fresh install reports).
 
-### 8. Configuration surface
+### 8. One-click backfill
+
+`SessionBackfill` turns the inventory the report already collects into an upload plan, then drives the ordinary capture path for it.
+
+`POST /plugin/session-log-universal/backfill`, optional JSON body:
+
+```json
+{ "maxSessions": 50, "maxBytes": 209715200 }
+```
+
+| field | rule |
+|---|---|
+| `maxSessions` | integer 1..500; `null` or absent → `DEFAULT_BACKFILL_SESSIONS` (50) |
+| `maxBytes` | integer 1 MiB..2 GiB; `null` or absent → `DEFAULT_BACKFILL_BYTES` (200 MiB) |
+| body size | above `BACKFILL_BODY_MAX_BYTES` (4096) the read stops and the request is refused |
+
+| outcome | answer |
+|---|---|
+| started | `200` + the report snapshot + `started: true` |
+| nothing owed | `200` + `started: false`, `sessions: 0` |
+| a run is already going | `409` + the snapshot (with `running: true`) |
+| bad JSON, non-integer or out-of-range limit, oversized body | `400` + `{ error }` |
+| uploading switched off | `400` |
+| non-loopback request | `403` |
+| any method other than GET/POST | `405` + `allow: GET, POST` |
+
+Selection (`selectBackfillTargets`): eligible means a stored session where `!isEmptyOf(...)` **and** `stateOf(...) !== "uploaded"` — a `partial` session still owes its tail. Eligible sessions are ordered by `updatedAt` descending, both caps apply at once, and the run stops at whichever is reached first; `skipped` is eligible minus chosen. One deliberate conservative case: if the **first** candidate alone exceeds `maxBytes`, the run selects **zero** sessions rather than squeezing an oversized one in — one deferred conversation is cheaper than one blown-up request.
+
+Execution (`SessionBackfill.run`) is serial and yields between sessions:
+
+```text
+for each target:                      (newest activity first)
+   uploader.discard(sessionId)        ← drop the queued copies first, or the
+   queued.delete(sessionId)             replay would upload a second copy
+   await captureAny(sessionId)        ← re-read the owed tail from the checkpoint
+   await uploader.drain()             ← one batch at a time, still ack-gated
+   watermark.flush()                  ← the checkpoint survives a crash
+   setImmediate(...)                  ← keep the event loop responsive
+```
+
+A session that throws is counted in `failed` and the run continues; `lastError` keeps the detail. `sentRecords` is the difference of the uploader's counter across the run, so it reports what actually left rather than what was planned.
+
+The state is published in the report as `backfill`: `{ running, startedAt, finishedAt, sessions, bytes, completed, failed, skipped, sentRecords, lastError, limits, defaults }`, where `limits` is what the run used and `defaults` is the allowance this Host publishes (`defaultBackfillLimits()`, always re-read at snapshot time). Its freshness is bounded by the report cache — that is why the client polls once per `REPORT_REFRESH_MILLIS` and progress moves in 5–10 second steps.
+
+`limits` and `defaults` are published separately on purpose: the UI shows the default allowance as small print next to the button and never builds its own, so a run started by a script with custom limits does not change what the page promises. The caps stay validated at the API boundary even though the page stopped exposing them — an out-of-range body is still `400`, not silently clamped.
+
+### 9. Configuration surface
 
 `Config` (`@deepseek-ai/schemastery`) validates the patch row's `config` block. `enabled` is declared `.volatile()`: the client can flip it on a live fiber without restarting the row, which is what the Settings switch does. Everything else is read once at load and needs a reload to change.
 
@@ -248,7 +301,7 @@ The status tab does not poll the Host config: a `ReportFeed` fetches the report 
 
 The request goes out as `plugin/session-log-universal/report` — the **document-relative** form, without the leading slash — through `globalThis.__DSH_TRANSPORT__.fetch` when the shell injected one, falling back to `fetch`. The desktop window is served from a custom scheme, so a rooted path is not the same origin as the Host route; the relative form is the one the shipped transport accepts. A plain browser tab reaches the identical route as `http://127.0.0.1:<port>/plugin/session-log-universal/report`.
 
-The tab renders, in order: the totals (sessions, uploaded, partial, never, **uploaded events** = `totals.ackedEvents`), the generation instant, the collector endpoint, a Refresh button, one line of visibility counters, the search box (title / session id / directory), the row list, and — when the report was cut — a line saying how many conversations with content are not shown (`moreSessions`).
+The tab renders, in order: five fixed totals (sessions, uploaded, partial, never, **uploaded events** = `totals.ackedEvents`) with two of them acting as filter buttons, the toolbar (one-click upload, refresh, and the default-allowance line built from `backfill.defaults`), the last-run result line, the generation instant, the collector endpoint, one line of visibility counters, the search box (title / session id / directory), the row list, and — when the report was cut — a line saying how many conversations with content are not shown (`moreSessions`). The five cards are always rendered: a card that vanished when its count reached zero would reflow the row and hide the fact that the state exists.
 
 | row part | source |
 |---|---|
@@ -257,6 +310,10 @@ The tab renders, in order: the totals (sessions, uploaded, partial, never, **upl
 | facts | event count (`localEvents` — "event count unknown" when `null`, never a 0), log size (`sizeBytes`), upstream progress (`acked`/`total`, or `acked` only when the total is unknown, or "acknowledged through N · newer content exists" for an open-ended partial), and a subagent marker when `parentSession` is set |
 | badge | `state` → green 已上传 / light gray 未上传, or 部分 {acked}/{total} 条 when the count is known and plain 部分上传 when it is not |
 | evidence | `upstream.code` as `HTTP nnn`, `ackedAt` as a relative time, `upstream.note` as the tooltip |
+
+Interaction state lives entirely in the tab: `filter` (`all` / `uploaded` / `pending`), the search text, and the two cap inputs. "Not uploaded" filters on `state !== "uploaded"`, so the partial rows stay with it — they are not finished either. Filter and search compose, and the visibility line counts what survives both, which is why it is computed from the filtered rows rather than from `totals`.
+
+The one-click button posts a fixed body — `{ maxSessions: null, maxBytes: null }` — and then re-reads the report, so the run always takes the Host defaults; a `200` starts the run, `409` means another run is still going, `400` surfaces the Host's own message (bad limit, oversized body, uploading off). While `backfill.running` is true the button is disabled and reads `uploading completed/sessions`; the tab polls the report every `REPORT_REFRESH_MILLIS`, so that counter advances in 5–10 second steps rather than continuously. When the run ends, the result line distinguishes "backfilled N conversations" from "nothing to backfill" (`sessions === 0 && skipped === 0`) and from "the cap is too small for any single conversation" (`sessions === 0 && skipped > 0`).
 
 Visibility is decided by the Host's `isEmpty`, not by the client: a conversation with no events takes no row (a line above the list counts the hidden ones, and the row still counts in the totals), and `totals.events` is deliberately not shown as a headline because it is only a lower bound. The list is therefore conversations that can actually say something about uploads.
 
@@ -283,7 +340,7 @@ Two dictionaries live in the bundle (`settings.sessionLogUniversal` for the swit
 
 | file | covers | runs |
 |---|---|---|
-| `tests/report.test.mjs` | `stateOf` (both length-known and length-unknown branches), `isEmptyOf`, `upstreamOf`, `titleFromEvents`, `buildReport` (order, totals, `moreSessions`, truncation), `SessionReport` title budgets and source-failure degradation, `reportHandler`, `describeResponse`, the published constants and `emptyReport` | everywhere |
+| `tests/report.test.mjs` | `stateOf` (both length-known and length-unknown branches), `isEmptyOf`, `upstreamOf`, `titleFromEvents`, `buildReport` (order, totals, `moreSessions`, truncation), `SessionReport` title budgets and source-failure degradation, `parseBackfillLimits`, `selectBackfillTargets` (caps, order, defaults), `SessionBackfill` (runs once, refuses a second run, survives a failing session, nothing owed, uploading off), `reportHandler` for GET and POST (200/400/403/405/409/500), `describeResponse`, the published constants and `emptyReport` | everywhere |
 | `tests/watermark.test.mjs` | monotonic advance, receipts, failure evidence, atomic write and reload, legacy `{seq, at}` rows, corrupt-file recovery | needs `@deepseek-ai/schemastery`, so it skips itself in a plain checkout; set `DSH_SLU_HOST_MODULE` to an installed `lib/index.js` to run it |
 
 The route handler is exercised against a fake `request`/`response` pair, which is what pins the contract the client depends on: `200` with `content-type` and `cache-control: no-store`, `405` plus `allow: GET`, `403` for a foreign authority, and `500` with the diagnostic when the build throws.
